@@ -75,6 +75,8 @@ class LLMModelConfig:
     timeout: int = None
     retries: int = None
     retry_delay: int = None
+    # Provider-specific OpenAI-compatible request body extensions
+    extra_body: Optional[Dict[str, Any]] = None
 
     # Reproducibility
     random_seed: Optional[int] = None
@@ -188,6 +190,7 @@ class LLMConfig(LLMModelConfig):
             "timeout": self.timeout,
             "retries": self.retries,
             "retry_delay": self.retry_delay,
+            "extra_body": self.extra_body,
             "random_seed": self.random_seed,
             "reasoning_effort": self.reasoning_effort,
             "manual_mode": self.manual_mode,
@@ -245,6 +248,7 @@ class LLMConfig(LLMModelConfig):
             "timeout": self.timeout,
             "retries": self.retries,
             "retry_delay": self.retry_delay,
+            "extra_body": self.extra_body,
             "random_seed": self.random_seed,
             "reasoning_effort": self.reasoning_effort,
         }

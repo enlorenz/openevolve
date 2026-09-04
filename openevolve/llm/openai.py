@@ -59,6 +59,7 @@ class OpenAILLM(LLMInterface):
         self.timeout = model_cfg.timeout
         self.retries = model_cfg.retries
         self.retry_delay = model_cfg.retry_delay
+        self.extra_body = getattr(model_cfg, "extra_body", None)
         self.api_base = model_cfg.api_base
         self.api_key = model_cfg.api_key
         self.random_seed = getattr(model_cfg, "random_seed", None)
@@ -165,6 +166,9 @@ class OpenAILLM(LLMInterface):
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
+
+        if self.extra_body is not None:
+            params["extra_body"] = self.extra_body
 
         # Add seed parameter for reproducibility if configured
         # Skip seed parameter for Google AI Studio endpoint as it doesn't support it
