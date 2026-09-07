@@ -34,6 +34,7 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
+    parent_program_dict: Optional[Dict[str, Any]] = None  # Parent fields needed for tracing
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -318,6 +319,12 @@ def _run_iteration_worker(
 
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
+            parent_program_dict={
+                "id": parent.id,
+                "code": parent.code,
+                "changes_description": parent.changes_description,
+                "metrics": parent.metrics,
+            },
             parent_id=parent.id,
             iteration_time=iteration_time,
             prompt=prompt,
@@ -630,10 +637,14 @@ class ProcessParallelController:
 
                     # Log evolution trace
                     if self.evolution_tracer:
-                        # Retrieve parent program for trace logging
-                        parent_program = (
-                            self.database.get(result.parent_id) if result.parent_id else None
-                        )
+                        # Prefer the parent snapshot captured by the worker. The mutable
+                        # database may have removed this parent while the task was in flight.
+                        if result.parent_program_dict:
+                            parent_program = Program.from_dict(result.parent_program_dict)
+                        elif result.parent_id:
+                            parent_program = self.database.get(result.parent_id)
+                        else:
+                            parent_program = None
                         if parent_program:
                             # Determine island ID
                             island_id = child_program.metadata.get(

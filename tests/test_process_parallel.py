@@ -3,11 +3,12 @@ Tests for process-based parallel controller
 """
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import AsyncMock, Mock, patch, MagicMock
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 
@@ -23,6 +24,7 @@ os.environ["OPENAI_API_KEY"] = "test"
 
 from openevolve.config import Config, DatabaseConfig, EvaluatorConfig, LLMConfig, PromptConfig
 from openevolve.database import Program, ProgramDatabase
+from openevolve.evolution_trace import EvolutionTracer
 from openevolve import process_parallel as process_parallel_module
 from openevolve.process_parallel import ProcessParallelController, SerializableResult
 
@@ -211,6 +213,131 @@ def evaluate(program_path):
                 self.assertEqual(child.metrics["score"], 0.7)
 
         # Run the async test
+        asyncio.run(run_test())
+
+    def test_trace_uses_parent_snapshot_after_parent_is_removed(self):
+        """An in-flight child retains provenance after orphan cleanup removes its parent."""
+
+        self.config.language = "python"
+        self.config.diff_based_evolution = False
+        trace_path = Path(self.test_dir) / "trace.jsonl"
+        tracer = EvolutionTracer(
+            output_path=str(trace_path),
+            format="jsonl",
+            include_code=True,
+            include_prompts=False,
+            buffer_size=1,
+        )
+        controller = ProcessParallelController(
+            self.config,
+            self.eval_file,
+            self.database,
+            evolution_tracer=tracer,
+        )
+
+        parent = self.database.get("test_0")
+        parent.changes_description = "parent provenance"
+        prompt_sampler = Mock()
+        prompt_sampler.build_prompt.return_value = {
+            "system": "system prompt",
+            "user": "user prompt",
+        }
+        llm_ensemble = Mock()
+        llm_ensemble.generate_with_context = AsyncMock(
+            return_value="def evolved(): return 1"
+        )
+        evaluator = Mock()
+        evaluator.evaluate_program = AsyncMock(
+            return_value={"score": 0.7, "performance": 0.8}
+        )
+        evaluator.get_pending_artifacts.return_value = None
+
+        snapshot = controller._create_database_snapshot()
+        snapshot["sampling_island"] = 0
+        with (
+            patch.object(process_parallel_module, "_lazy_init_worker_components"),
+            patch.object(process_parallel_module, "_worker_config", self.config, create=True),
+            patch.object(
+                process_parallel_module,
+                "_worker_prompt_sampler",
+                prompt_sampler,
+                create=True,
+            ),
+            patch.object(
+                process_parallel_module,
+                "_worker_llm_ensemble",
+                llm_ensemble,
+                create=True,
+            ),
+            patch.object(
+                process_parallel_module,
+                "_worker_evaluator",
+                evaluator,
+                create=True,
+            ),
+        ):
+            worker_result = process_parallel_module._run_iteration_worker(
+                1,
+                snapshot,
+                parent.id,
+                [],
+            )
+
+        self.assertIsNone(worker_result.error)
+        self.assertEqual(
+            worker_result.parent_program_dict,
+            {
+                "id": parent.id,
+                "code": parent.code,
+                "changes_description": parent.changes_description,
+                "metrics": parent.metrics,
+            },
+        )
+
+        async def run_test():
+            controller.executor = Mock()
+            future = MagicMock()
+            future.result.return_value = worker_result
+
+            def remove_parent_then_complete():
+                # Simulate MAP-Elites displacement followed by orphan cleanup while
+                # the already-submitted child is still in flight.
+                for feature_map in self.database.island_feature_maps:
+                    for key, program_id in list(feature_map.items()):
+                        if program_id == parent.id:
+                            del feature_map[key]
+                for island in self.database.islands:
+                    island.discard(parent.id)
+                self.database._remove_program_if_orphaned(parent.id)
+                self.assertIsNone(self.database.get(parent.id))
+                return True
+
+            future.done.side_effect = remove_parent_then_complete
+
+            with patch.object(
+                controller,
+                "_submit_iteration",
+                return_value=future,
+            ) as mock_submit:
+                await controller.run_evolution(
+                    start_iteration=1,
+                    max_iterations=1,
+                    target_score=None,
+                )
+                mock_submit.assert_called_once_with(1, 0)
+
+            tracer.close()
+
+            with trace_path.open("r", encoding="utf-8") as trace_file:
+                trace = json.loads(trace_file.readline())
+
+            self.assertEqual(trace["iteration"], 1)
+            self.assertEqual(trace["parent_id"], parent.id)
+            self.assertEqual(trace["parent_metrics"], parent.metrics)
+            self.assertEqual(trace["parent_code"], parent.code)
+            self.assertEqual(trace["parent_changes_description"], "parent provenance")
+            self.assertEqual(trace["child_id"], worker_result.child_program_dict["id"])
+
         asyncio.run(run_test())
 
     def test_request_shutdown(self):
