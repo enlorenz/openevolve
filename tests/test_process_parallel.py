@@ -237,6 +237,11 @@ def evaluate(program_path):
 
         parent = self.database.get("test_0")
         parent.changes_description = "parent provenance"
+        parent_cell = parent.metadata["map_elites_cell"]
+        self.assertEqual(
+            self.database.island_feature_maps[0]["-".join(map(str, parent_cell))],
+            parent.id,
+        )
         prompt_sampler = Mock()
         prompt_sampler.build_prompt.return_value = {
             "system": "system prompt",
@@ -291,6 +296,7 @@ def evaluate(program_path):
                 "code": parent.code,
                 "changes_description": parent.changes_description,
                 "metrics": parent.metrics,
+                "metadata": {"map_elites_cell": parent_cell},
             },
         )
 
@@ -337,6 +343,12 @@ def evaluate(program_path):
             self.assertEqual(trace["parent_code"], parent.code)
             self.assertEqual(trace["parent_changes_description"], "parent provenance")
             self.assertEqual(trace["child_id"], worker_result.child_program_dict["id"])
+            self.assertEqual(trace["metadata"]["parent_map_elites_cell"], parent_cell)
+            child = self.database.get(worker_result.child_program_dict["id"])
+            self.assertEqual(
+                trace["metadata"]["map_elites_cell"],
+                child.metadata["map_elites_cell"],
+            )
 
         asyncio.run(run_test())
 

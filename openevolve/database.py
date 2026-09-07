@@ -235,6 +235,8 @@ class ProgramDatabase:
 
         # Calculate feature coordinates for MAP-Elites
         feature_coords = self._calculate_feature_coords(program)
+        # Preserve the insertion-time coordinate before normalization ranges evolve.
+        program.metadata["map_elites_cell"] = list(feature_coords)
 
         # Determine target island
         # If target_island is not specified and program has a parent, inherit parent's island

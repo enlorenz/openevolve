@@ -324,6 +324,9 @@ def _run_iteration_worker(
                 "code": parent.code,
                 "changes_description": parent.changes_description,
                 "metrics": parent.metrics,
+                "metadata": {
+                    "map_elites_cell": parent.metadata.get("map_elites_cell"),
+                },
             },
             parent_id=parent.id,
             iteration_time=iteration_time,
@@ -662,6 +665,12 @@ class ProcessParallelController:
                                 metadata={
                                     "iteration_time": result.iteration_time,
                                     "changes": child_program.metadata.get("changes", ""),
+                                    "map_elites_cell": child_program.metadata.get(
+                                        "map_elites_cell"
+                                    ),
+                                    "parent_map_elites_cell": parent_program.metadata.get(
+                                        "map_elites_cell"
+                                    ),
                                 },
                             )
 
