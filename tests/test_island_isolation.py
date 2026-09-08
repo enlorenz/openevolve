@@ -68,12 +68,17 @@ class TestIslandIsolation(unittest.TestCase):
         # Track which islands were sampled
         sampled_islands = []
 
-        def mock_sample_from_island(island_id, num_inspirations=None):
+        def mock_sample_from_island(
+            island_id, num_inspirations=None, include_selection_source=False
+        ):
             # Record which island was sampled (using the island_id parameter)
             sampled_islands.append(island_id)
             # Return mock parent and inspirations
             mock_program = Program(id="mock", code="", metrics={})
-            return mock_program, []
+            result = (mock_program, [])
+            if include_selection_source:
+                return (*result, "island_random")
+            return result
 
         with patch.object(self.database, "sample_from_island", side_effect=mock_sample_from_island):
             with patch.object(controller, "executor"):

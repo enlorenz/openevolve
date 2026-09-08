@@ -423,8 +423,14 @@ class ProgramDatabase:
         return parent, inspirations
 
     def sample_from_island(
-        self, island_id: int, num_inspirations: Optional[int] = None
-    ) -> Tuple[Program, List[Program]]:
+        self,
+        island_id: int,
+        num_inspirations: Optional[int] = None,
+        include_selection_source: bool = False,
+    ) -> Union[
+        Tuple[Program, List[Program]],
+        Tuple[Program, List[Program], str],
+    ]:
         """
         Sample a program and inspirations from a specific island without modifying current_island
 
@@ -437,9 +443,11 @@ class ProgramDatabase:
         Args:
             island_id: The island to sample from
             num_inspirations: Number of inspiration programs to sample (defaults to 5)
+            include_selection_source: Include the exact island/global sampling source
 
         Returns:
-            Tuple of (parent_program, inspiration_programs)
+            Tuple of (parent_program, inspiration_programs), optionally followed by
+            the selection source when include_selection_source is true
         """
         # Ensure valid island ID
         island_id = island_id % len(self.islands)
@@ -450,23 +458,27 @@ class ProgramDatabase:
         if not island_programs:
             # Island is empty, fall back to sampling from all programs
             logger.debug(f"Island {island_id} is empty, sampling from all programs")
-            return self.sample(num_inspirations)
+            parent, inspirations = self.sample(num_inspirations)
+            if include_selection_source:
+                return parent, inspirations, "global_fallback_empty_island"
+            return parent, inspirations
 
         # Use exploration_ratio and exploitation_ratio to decide sampling strategy
         # This matches the logic in _sample_parent() for consistent behavior
         rand_val = random.random()
+        selection_provenance: Dict[str, str] = {}
 
         if rand_val < self.config.exploration_ratio:
             # EXPLORATION: Sample randomly from island (diverse sampling)
-            parent = self._sample_from_island_random(island_id)
+            parent = self._sample_from_island_random(island_id, selection_provenance)
             sampling_mode = "exploration"
         elif rand_val < self.config.exploration_ratio + self.config.exploitation_ratio:
             # EXPLOITATION: Sample from archive (elite programs)
-            parent = self._sample_from_archive_for_island(island_id)
+            parent = self._sample_from_archive_for_island(island_id, selection_provenance)
             sampling_mode = "exploitation"
         else:
             # WEIGHTED: Use fitness-weighted sampling (remaining probability)
-            parent = self._sample_from_island_weighted(island_id)
+            parent = self._sample_from_island_weighted(island_id, selection_provenance)
             sampling_mode = "weighted"
 
         # Select inspirations using the same elite/diversity-aware strategy as sample().
@@ -481,6 +493,8 @@ class ProgramDatabase:
             f"Sampled parent {parent.id} and {len(inspirations)} inspirations from island {island_id} "
             f"(mode: {sampling_mode}, rand_val: {rand_val:.3f})"
         )
+        if include_selection_source:
+            return parent, inspirations, selection_provenance["source"]
         return parent, inspirations
 
     def get_best_program(self, metric: Optional[str] = None) -> Optional[Program]:
@@ -1436,7 +1450,9 @@ class ProgramDatabase:
         program_id = random.choice(list(self.programs.keys()))
         return self.programs[program_id]
 
-    def _sample_from_island_weighted(self, island_id: int) -> Program:
+    def _sample_from_island_weighted(
+        self, island_id: int, selection_provenance: Optional[Dict[str, str]] = None
+    ) -> Program:
         """
         Sample a parent from a specific island using fitness-weighted selection
 
@@ -1452,6 +1468,8 @@ class ProgramDatabase:
         if not island_programs:
             # Island is empty, fall back to any available program
             logger.debug(f"Island {island_id} is empty, sampling from all programs")
+            if selection_provenance is not None:
+                selection_provenance["source"] = "global_fallback_empty_island"
             return self._sample_random_parent()
 
         # Select parent from island programs
@@ -1489,11 +1507,17 @@ class ProgramDatabase:
         if not parent:
             # Should not happen, but handle gracefully
             logger.error(f"Parent program {parent_id} not found in database")
+            if selection_provenance is not None:
+                selection_provenance["source"] = "global_fallback_invalid_island"
             return self._sample_random_parent()
 
+        if selection_provenance is not None:
+            selection_provenance.setdefault("source", "island_weighted")
         return parent
 
-    def _sample_from_island_random(self, island_id: int) -> Program:
+    def _sample_from_island_random(
+        self, island_id: int, selection_provenance: Optional[Dict[str, str]] = None
+    ) -> Program:
         """
         Sample a completely random parent from a specific island (uniform distribution)
 
@@ -1509,6 +1533,8 @@ class ProgramDatabase:
         if not island_programs:
             # Island is empty, fall back to any available program
             logger.debug(f"Island {island_id} is empty, sampling from all programs")
+            if selection_provenance is not None:
+                selection_provenance["source"] = "global_fallback_empty_island"
             return self._sample_random_parent()
 
         # Clean up stale references
@@ -1518,13 +1544,19 @@ class ProgramDatabase:
             logger.warning(
                 f"Island {island_id} has no valid programs, falling back to random sampling"
             )
+            if selection_provenance is not None:
+                selection_provenance["source"] = "global_fallback_invalid_island"
             return self._sample_random_parent()
 
         # Uniform random selection
         parent_id = random.choice(valid_programs)
+        if selection_provenance is not None:
+            selection_provenance.setdefault("source", "island_random")
         return self.programs[parent_id]
 
-    def _sample_from_archive_for_island(self, island_id: int) -> Program:
+    def _sample_from_archive_for_island(
+        self, island_id: int, selection_provenance: Optional[Dict[str, str]] = None
+    ) -> Program:
         """
         Sample a parent from the archive, preferring programs from the specified island
 
@@ -1537,7 +1569,9 @@ class ProgramDatabase:
         if not self.archive:
             # Fallback to weighted sampling from island
             logger.debug(f"Archive is empty, falling back to weighted island sampling")
-            return self._sample_from_island_weighted(island_id)
+            if selection_provenance is not None:
+                selection_provenance["source"] = "island_weighted_empty_archive_fallback"
+            return self._sample_from_island_weighted(island_id, selection_provenance)
 
         # Clean up stale references in archive
         valid_archive = [pid for pid in self.archive if pid in self.programs]
@@ -1546,7 +1580,9 @@ class ProgramDatabase:
             logger.warning(
                 "Archive has no valid programs, falling back to weighted island sampling"
             )
-            return self._sample_from_island_weighted(island_id)
+            if selection_provenance is not None:
+                selection_provenance["source"] = "island_weighted_invalid_archive_fallback"
+            return self._sample_from_island_weighted(island_id, selection_provenance)
 
         island_id = island_id % len(self.islands)
 
@@ -1557,10 +1593,14 @@ class ProgramDatabase:
 
         if archive_programs_in_island:
             parent_id = random.choice(archive_programs_in_island)
+            if selection_provenance is not None:
+                selection_provenance["source"] = "island_archive"
             return self.programs[parent_id]
         else:
             # Fall back to any valid archive program if island has none
             parent_id = random.choice(valid_archive)
+            if selection_provenance is not None:
+                selection_provenance["source"] = "global_fallback_archive"
             return self.programs[parent_id]
 
     def _sample_inspirations(
@@ -1913,7 +1953,12 @@ class ProgramDatabase:
                         parent_id=migrant.id,
                         generation=migrant.generation,
                         metrics=migrant.metrics.copy(),
-                        metadata={**migrant.metadata, "island": target_island, "migrant": True},
+                        metadata={
+                            **migrant.metadata,
+                            "island": target_island,
+                            "migrant": True,
+                            "migration_source_island": i,
+                        },
                     )
 
                     # Use add() method to properly handle MAP-Elites deduplication,

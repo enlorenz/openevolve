@@ -154,6 +154,30 @@ class TestSampleFromIslandRatios(unittest.TestCase):
             self.assertIsNotNone(parent)
             self.assertIn(parent.id, self.db.programs)
 
+    def test_selection_source_distinguishes_local_and_archive_fallback(self):
+        """Selection provenance identifies the exact source of cross-island parents."""
+        self.db.config.exploration_ratio = 1.0
+        self.db.config.exploitation_ratio = 0.0
+
+        parent, _, source = self.db.sample_from_island(
+            island_id=0,
+            include_selection_source=True,
+        )
+        self.assertEqual(parent.metadata["island"], 0)
+        self.assertEqual(source, "island_random")
+
+        foreign_parent_id = next(iter(self.db.islands[1]))
+        self.db.archive = {foreign_parent_id}
+        self.db.config.exploration_ratio = 0.0
+        self.db.config.exploitation_ratio = 1.0
+
+        parent, _, source = self.db.sample_from_island(
+            island_id=0,
+            include_selection_source=True,
+        )
+        self.assertEqual(parent.metadata["island"], 1)
+        self.assertEqual(source, "global_fallback_archive")
+
     def test_exploration_mode_uniform_distribution(self):
         """Test that exploration mode uses uniform random sampling"""
         # Force exploration ratio to 1.0
@@ -233,10 +257,14 @@ class TestSampleFromIslandEdgeCases(unittest.TestCase):
             self.db.add(program, target_island=0)
 
         # Try to sample from empty island 1
-        parent, inspirations = self.db.sample_from_island(island_id=1)
+        parent, inspirations, source = self.db.sample_from_island(
+            island_id=1,
+            include_selection_source=True,
+        )
 
         # Should still return a parent (from fallback)
         self.assertIsNotNone(parent)
+        self.assertEqual(source, "global_fallback_empty_island")
 
     def test_empty_archive_fallback(self):
         """Test exploitation mode with empty archive"""

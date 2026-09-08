@@ -35,6 +35,7 @@ class SerializableResult:
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
     parent_program_dict: Optional[Dict[str, Any]] = None  # Parent fields needed for tracing
+    parent_selection_source: Optional[str] = None
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -133,7 +134,11 @@ def _lazy_init_worker_components():
 
 
 def _run_iteration_worker(
-    iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
+    iteration: int,
+    db_snapshot: Dict[str, Any],
+    parent_id: str,
+    inspiration_ids: List[str],
+    parent_selection_source: Optional[str] = None,
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
@@ -323,9 +328,17 @@ def _run_iteration_worker(
                 "id": parent.id,
                 "code": parent.code,
                 "changes_description": parent.changes_description,
+                "parent_id": parent.parent_id,
+                "generation": parent.generation,
+                "iteration_found": parent.iteration_found,
                 "metrics": parent.metrics,
                 "metadata": {
                     "map_elites_cell": parent.metadata.get("map_elites_cell"),
+                    "island": parent.metadata.get("island"),
+                    "migrant": parent.metadata.get("migrant", False),
+                    "migration_source_island": parent.metadata.get(
+                        "migration_source_island"
+                    ),
                 },
             },
             parent_id=parent.id,
@@ -335,6 +348,7 @@ def _run_iteration_worker(
             artifacts=artifacts,
             iteration=iteration,
             target_island=target_island,
+            parent_selection_source=parent_selection_source,
         )
 
     except Exception as e:
@@ -653,6 +667,33 @@ class ProcessParallelController:
                             island_id = child_program.metadata.get(
                                 "island", self.database.current_island
                             )
+                            trace_metadata = {
+                                "iteration_time": result.iteration_time,
+                                "changes": child_program.metadata.get("changes", ""),
+                                "map_elites_cell": child_program.metadata.get(
+                                    "map_elites_cell"
+                                ),
+                                "parent_map_elites_cell": parent_program.metadata.get(
+                                    "map_elites_cell"
+                                ),
+                            }
+                            parent_island_id = parent_program.metadata.get("island")
+                            if parent_island_id is not None:
+                                trace_metadata["parent_island_id"] = parent_island_id
+                            if result.parent_selection_source is not None:
+                                trace_metadata["parent_selection_source"] = (
+                                    result.parent_selection_source
+                                )
+                            if (
+                                parent_program.metadata.get("migrant", False)
+                                and parent_program.parent_id
+                            ):
+                                trace_metadata["parent_migration"] = {
+                                    "source_program_id": parent_program.parent_id,
+                                    "source_island_id": parent_program.metadata.get(
+                                        "migration_source_island"
+                                    ),
+                                }
 
                             self.evolution_tracer.log_trace(
                                 iteration=completed_iteration,
@@ -662,16 +703,7 @@ class ProcessParallelController:
                                 llm_response=result.llm_response,
                                 artifacts=result.artifacts,
                                 island_id=island_id,
-                                metadata={
-                                    "iteration_time": result.iteration_time,
-                                    "changes": child_program.metadata.get("changes", ""),
-                                    "map_elites_cell": child_program.metadata.get(
-                                        "map_elites_cell"
-                                    ),
-                                    "parent_map_elites_cell": parent_program.metadata.get(
-                                        "map_elites_cell"
-                                    ),
-                                },
+                                metadata=trace_metadata,
                             )
 
                     # Log prompts
@@ -882,9 +914,12 @@ class ProcessParallelController:
             # Inspirations are the diverse/creative examples; size them by
             # num_diverse_programs (not num_top_programs) so the config parameter
             # actually controls the inspiration count (GitHub issue #452).
-            parent, inspirations = self.database.sample_from_island(
-                island_id=target_island,
-                num_inspirations=self.config.prompt.num_diverse_programs,
+            parent, inspirations, parent_selection_source = (
+                self.database.sample_from_island(
+                    island_id=target_island,
+                    num_inspirations=self.config.prompt.num_diverse_programs,
+                    include_selection_source=True,
+                )
             )
 
             # Create database snapshot
@@ -898,6 +933,7 @@ class ProcessParallelController:
                 db_snapshot,
                 parent.id,
                 [insp.id for insp in inspirations],
+                parent_selection_source,
             )
 
             return future

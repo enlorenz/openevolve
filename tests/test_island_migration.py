@@ -245,9 +245,13 @@ class TestIslandMigration(unittest.TestCase):
 
             # Should have proper parent reference
             self.assertEqual(migrant.parent_id, "original")
+            self.assertNotEqual(migrant.id, program.id)
+            self.assertEqual(migrant.generation, program.generation)
+            self.assertEqual(migrant.iteration_found, 0)
 
             # Should be marked as migrant
             self.assertTrue(migrant.metadata.get("migrant", False))
+            self.assertEqual(migrant.metadata["migration_source_island"], 0)
 
             # Should be in correct target island
             target_island = migrant.metadata["island"]

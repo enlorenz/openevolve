@@ -70,6 +70,37 @@ def evaluate(program_path):
             )
             self.database.add(program, target_island=i)
 
+    def _complete_result_and_read_trace(self, result, filename):
+        trace_path = Path(self.test_dir) / filename
+        tracer = EvolutionTracer(
+            output_path=str(trace_path),
+            format="jsonl",
+            include_prompts=False,
+            buffer_size=1,
+        )
+        controller = ProcessParallelController(
+            self.config,
+            self.eval_file,
+            self.database,
+            evolution_tracer=tracer,
+        )
+        controller.executor = Mock()
+        future = MagicMock()
+        future.done.return_value = True
+        future.result.return_value = result
+
+        async def complete():
+            with patch.object(controller, "_submit_iteration", return_value=future):
+                await controller.run_evolution(
+                    start_iteration=result.iteration,
+                    max_iterations=1,
+                    target_score=None,
+                )
+
+        asyncio.run(complete())
+        tracer.close()
+        return json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
+
     def tearDown(self):
         """Clean up test environment"""
         import shutil
@@ -215,6 +246,22 @@ def evaluate(program_path):
         # Run the async test
         asyncio.run(run_test())
 
+    def test_submit_iteration_carries_archive_fallback_source(self):
+        """Submission snapshots the specific source of a foreign parent selection."""
+        self.config.database.exploration_ratio = 0.0
+        self.config.database.exploitation_ratio = 1.0
+        self.database.archive = {"test_1"}
+        controller = ProcessParallelController(self.config, self.eval_file, self.database)
+        controller.executor = Mock()
+        controller.executor.submit.return_value = MagicMock()
+
+        controller._submit_iteration(1, island_id=0)
+
+        worker_args = controller.executor.submit.call_args.args
+        self.assertEqual(worker_args[3], "test_1")
+        self.assertEqual(worker_args[5], "global_fallback_archive")
+        self.assertEqual(worker_args[2]["sampling_island"], 0)
+
     def test_trace_uses_parent_snapshot_after_parent_is_removed(self):
         """An in-flight child retains provenance after orphan cleanup removes its parent."""
 
@@ -286,6 +333,7 @@ def evaluate(program_path):
                 snapshot,
                 parent.id,
                 [],
+                "island_random",
             )
 
         self.assertIsNone(worker_result.error)
@@ -295,8 +343,16 @@ def evaluate(program_path):
                 "id": parent.id,
                 "code": parent.code,
                 "changes_description": parent.changes_description,
+                "parent_id": parent.parent_id,
+                "generation": parent.generation,
+                "iteration_found": parent.iteration_found,
                 "metrics": parent.metrics,
-                "metadata": {"map_elites_cell": parent_cell},
+                "metadata": {
+                    "map_elites_cell": parent_cell,
+                    "island": 0,
+                    "migrant": False,
+                    "migration_source_island": None,
+                },
             },
         )
 
@@ -344,6 +400,8 @@ def evaluate(program_path):
             self.assertEqual(trace["parent_changes_description"], "parent provenance")
             self.assertEqual(trace["child_id"], worker_result.child_program_dict["id"])
             self.assertEqual(trace["metadata"]["parent_map_elites_cell"], parent_cell)
+            self.assertEqual(trace["metadata"]["parent_island_id"], 0)
+            self.assertEqual(trace["metadata"]["parent_selection_source"], "island_random")
             child = self.database.get(worker_result.child_program_dict["id"])
             self.assertEqual(
                 trace["metadata"]["map_elites_cell"],
@@ -351,6 +409,88 @@ def evaluate(program_path):
             )
 
         asyncio.run(run_test())
+
+    def test_cross_island_archive_fallback_provenance_reaches_trace(self):
+        """A foreign archive parent records its exact selection source and island."""
+        self.config.database.exploration_ratio = 0.0
+        self.config.database.exploitation_ratio = 1.0
+        self.database.archive = {"test_1"}
+        parent, _, selection_source = self.database.sample_from_island(
+            island_id=0,
+            include_selection_source=True,
+        )
+        self.assertEqual(parent.metadata["island"], 1)
+        self.assertEqual(selection_source, "global_fallback_archive")
+
+        result = SerializableResult(
+            child_program_dict={
+                "id": "cross_island_child",
+                "code": "def cross_island_child(): return 1",
+                "language": "python",
+                "parent_id": parent.id,
+                "generation": parent.generation + 1,
+                "metrics": {"score": 0.9, "performance": 0.9},
+                "iteration_found": 1,
+                "metadata": {"changes": "cross-island test", "island": 1},
+            },
+            parent_program_dict=parent.to_dict(),
+            parent_id=parent.id,
+            iteration=1,
+            target_island=0,
+            parent_selection_source=selection_source,
+        )
+
+        trace = self._complete_result_and_read_trace(result, "cross-island-trace.jsonl")
+        self.assertEqual(trace["parent_id"], parent.id)
+        self.assertEqual(trace["island_id"], 0)
+        self.assertEqual(trace["metadata"]["parent_island_id"], 1)
+        self.assertEqual(
+            trace["metadata"]["parent_selection_source"],
+            "global_fallback_archive",
+        )
+        self.assertNotIn("parent_migration", trace["metadata"])
+
+    def test_migrant_parent_provenance_reaches_trace(self):
+        """A real migration clone is identified separately when it later reproduces."""
+        self.database.migrate_programs()
+        migrant = next(
+            program
+            for program in self.database.programs.values()
+            if program.metadata.get("migrant")
+            and program.metadata.get("migration_source_island") == 0
+        )
+
+        result = SerializableResult(
+            child_program_dict={
+                "id": "migrant_child",
+                "code": "def migrant_child(): return 1",
+                "language": "python",
+                "parent_id": migrant.id,
+                "generation": migrant.generation + 1,
+                "metrics": {"score": 0.95, "performance": 0.95},
+                "iteration_found": 1,
+                "metadata": {
+                    "changes": "migrant reproduction test",
+                    "island": migrant.metadata["island"],
+                },
+            },
+            parent_program_dict=migrant.to_dict(),
+            parent_id=migrant.id,
+            iteration=1,
+            target_island=migrant.metadata["island"],
+            parent_selection_source="island_random",
+        )
+
+        trace = self._complete_result_and_read_trace(result, "migration-trace.jsonl")
+        self.assertEqual(trace["metadata"]["parent_island_id"], migrant.metadata["island"])
+        self.assertEqual(trace["metadata"]["parent_selection_source"], "island_random")
+        self.assertEqual(
+            trace["metadata"]["parent_migration"],
+            {
+                "source_program_id": migrant.parent_id,
+                "source_island_id": 0,
+            },
+        )
 
     def test_request_shutdown(self):
         """Test graceful shutdown request"""
@@ -378,6 +518,7 @@ def evaluate(program_path):
         self.assertEqual(result.iteration_time, 1.5)
         self.assertEqual(result.iteration, 10)
         self.assertIsNone(result.error)
+        self.assertIsNone(result.parent_selection_source)
 
         # Test with error
         error_result = SerializableResult(error="Test error", iteration=5)
