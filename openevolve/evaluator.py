@@ -251,7 +251,15 @@ class Evaluator:
 
             except asyncio.TimeoutError:
                 # Handle timeout specially - don't retry, just return timeout result
-                logger.warning(f"Evaluation timed out after {self.config.timeout}s")
+                logger.warning(
+                    "Evaluator timeout: program_id=%s, candidate_path=%s, "
+                    "configured timeout=%s s, attempt=%s/%s; evaluator timeouts are not retried",
+                    program_id or "<unassigned>",
+                    temp_file_path,
+                    self.config.timeout,
+                    attempt + 1,
+                    self.config.max_retries + 1,
+                )
 
                 # Capture timeout artifacts if enabled
                 if artifacts_enabled and program_id:

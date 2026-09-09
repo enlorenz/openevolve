@@ -62,6 +62,7 @@ class OpenAILLM(LLMInterface):
         self.extra_body = getattr(model_cfg, "extra_body", None)
         self.api_base = model_cfg.api_base
         self.api_key = model_cfg.api_key
+        self.provider = getattr(model_cfg, "provider", None) or "openai-compatible"
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
 
@@ -198,12 +199,29 @@ class OpenAILLM(LLMInterface):
             try:
                 response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
                 return response
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, openai.APITimeoutError):
                 if attempt < retries:
-                    logger.warning(f"Timeout on attempt {attempt + 1}/{retries + 1}. Retrying...")
+                    logger.warning(
+                        "LLM timeout: model=%r, provider=%r, configured timeout=%s s, "
+                        "attempt=%s/%s; retrying after %s s",
+                        self.model,
+                        self.provider,
+                        timeout,
+                        attempt + 1,
+                        retries + 1,
+                        retry_delay,
+                    )
                     await asyncio.sleep(retry_delay)
                 else:
-                    logger.error(f"All {retries + 1} attempts failed with timeout")
+                    logger.error(
+                        "LLM timeout: model=%r, provider=%r, configured timeout=%s s, "
+                        "attempt=%s/%s; no retries remaining",
+                        self.model,
+                        self.provider,
+                        timeout,
+                        attempt + 1,
+                        retries + 1,
+                    )
                     raise
             except Exception as e:
                 if attempt < retries:
