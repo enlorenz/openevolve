@@ -6,7 +6,7 @@ import asyncio
 import os
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openevolve.config import Config, DatabaseConfig, EvaluatorConfig, PromptConfig
 from openevolve.database import Program, ProgramDatabase
@@ -196,13 +196,17 @@ def evaluate_stage1(program_path):
                 # If it returns a dict, wrap it
                 return EvaluationResult.from_dict(result)
 
-        # Mock the actual file operations since we're testing the cascade logic
-        with patch("openevolve.evaluator.run_in_executor") as mock_executor:
-            # Mock stage1 to return an error with artifacts
-            mock_executor.return_value = EvaluationResult(
-                metrics={"stage1_passed": 0.0}, artifacts={"stderr": "Stage 1 compilation error"}
-            )
-
+        # Mock the isolated call since this test targets cascade artifact merging.
+        with patch.object(
+            self.evaluator,
+            "_run_isolated_evaluation",
+            new=AsyncMock(
+                return_value=EvaluationResult(
+                    metrics={"stage1_passed": 0.0},
+                    artifacts={"stderr": "Stage 1 compilation error"},
+                )
+            ),
+        ):
             result = asyncio.run(run_test())
 
             # Should have failure metrics and artifacts

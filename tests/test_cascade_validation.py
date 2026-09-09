@@ -157,14 +157,6 @@ def evaluate(program_path):
         # Create a dummy program file
         program_path = self._create_evaluator_file("test_program.py", "def test(): pass")
 
-        # Mock the evaluation function
-        def mock_evaluate(path):
-            return EvaluationResult(
-                metrics={"score": 0.8, "accuracy": 0.9}, artifacts={"debug_info": "test data"}
-            )
-
-        evaluator.evaluate_function = mock_evaluate
-
         # Should handle EvaluationResult without issues
         result = await evaluator._direct_evaluate(program_path)
 
@@ -190,12 +182,6 @@ def evaluate(program_path):
 
         # Create a dummy program file
         program_path = self._create_evaluator_file("test_program.py", "def test(): pass")
-
-        # Mock the evaluation function directly
-        def mock_evaluate(path):
-            return {"score": 0.7, "performance": 0.85}
-
-        evaluator.evaluate_function = mock_evaluate
 
         # Should handle dict result without issues
         result = await evaluator._direct_evaluate(program_path)

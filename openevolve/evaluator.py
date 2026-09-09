@@ -7,6 +7,8 @@ import importlib.util
 import json
 import logging
 import os
+import pickle
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,11 +24,125 @@ from openevolve.database import ProgramDatabase
 from openevolve.evaluation_result import EvaluationResult
 from openevolve.database import ProgramDatabase
 from openevolve.llm.ensemble import LLMEnsemble
-from openevolve.utils.async_utils import TaskPool, run_in_executor
+from openevolve.utils.async_utils import TaskPool
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.utils.format_utils import format_metrics_safe
 
 logger = logging.getLogger(__name__)
+
+_EVALUATION_WORKER = Path(__file__).with_name("evaluation_worker.py")
+_PROCESS_TERMINATION_GRACE_SECONDS = 0.25
+_PROCESS_KILL_WAIT_SECONDS = 1.0
+_ISOLATION_PROTOCOL_VERSION = 1
+_PARENT_SYS_PATH_ENV = "OPENEVOLVE_EVALUATION_PARENT_SYS_PATH"
+
+
+class IsolatedEvaluationError(RuntimeError):
+    """Raised when an evaluator subprocess cannot return a usable result."""
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    """Return whether a POSIX process group still has any members."""
+
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_process_group_exit(process_group_id: int, timeout: float) -> bool:
+    """Poll for bounded process-group disappearance after termination."""
+
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group_id):
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+async def _terminate_evaluation_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate, kill if needed, and reap an isolated evaluator process tree."""
+
+    process_group_id = process.pid
+
+    if os.name == "posix":
+        if _process_group_exists(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        group_exited = await _wait_for_process_group_exit(
+            process_group_id,
+            _PROCESS_TERMINATION_GRACE_SECONDS,
+        )
+        if not group_exited:
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    elif process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=_PROCESS_TERMINATION_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=_PROCESS_KILL_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Isolated evaluator process did not exit after SIGKILL: pid=%s",
+                process.pid,
+            )
+            return
+
+    if os.name == "posix" and not await _wait_for_process_group_exit(
+        process_group_id,
+        _PROCESS_KILL_WAIT_SECONDS,
+    ):
+        logger.error(
+            "Isolated evaluator process group still exists after SIGKILL: pgid=%s",
+            process_group_id,
+        )
+
+
+def _raise_remote_evaluation_error(envelope: dict[str, Any]) -> None:
+    """Re-raise a transported exception when possible, retaining remote context."""
+
+    serialized_exception = envelope.get("serialized_exception")
+    if isinstance(serialized_exception, bytes):
+        try:
+            remote_exception = pickle.loads(serialized_exception)
+        except Exception:
+            remote_exception = None
+        if isinstance(remote_exception, Exception):
+            remote_traceback = envelope.get("traceback")
+            if remote_traceback and hasattr(remote_exception, "add_note"):
+                remote_exception.add_note(
+                    "Remote evaluator traceback:\n" + str(remote_traceback)
+                )
+            raise remote_exception
+
+    exception_type = envelope.get("exception_type", "unknown")
+    message = envelope.get("message", "")
+    remote_traceback = envelope.get("traceback", "")
+    raise IsolatedEvaluationError(
+        f"Remote evaluator raised {exception_type}: {message}\n{remote_traceback}"
+    )
 
 
 class Evaluator:
@@ -47,7 +163,7 @@ class Evaluator:
         suffix: Optional[str] = ".py",
     ):
         self.config = config
-        self.evaluation_file = evaluation_file
+        self.evaluation_file = os.path.abspath(evaluation_file)
         self.program_suffix = suffix
         self.llm_ensemble = llm_ensemble
         self.prompt_sampler = prompt_sampler
@@ -353,17 +469,103 @@ class Evaluator:
             Exception: If evaluation function raises an exception
         """
 
-        # Create a coroutine that runs the evaluation function in an executor
-        async def run_evaluation():
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.evaluate_function, program_path)
+        return await self._run_isolated_evaluation(program_path, "evaluate")
 
-        # Run the evaluation with timeout - let exceptions bubble up for retry handling
-        result = await asyncio.wait_for(run_evaluation(), timeout=self.config.timeout)
+    async def _run_isolated_evaluation(
+        self,
+        program_path: str,
+        function_name: str,
+    ) -> Any:
+        """Run one evaluator function behind a hard wall-clock process boundary."""
 
-        # Return result as-is to be processed by _process_evaluation_result
-        # This supports both dict and EvaluationResult returns, just like _cascade_evaluate
-        return result
+        result_fd, result_path = tempfile.mkstemp(
+            prefix="openevolve-evaluation-",
+            suffix=".pickle",
+        )
+        os.close(result_fd)
+        process: Optional[asyncio.subprocess.Process] = None
+        started_at = time.monotonic()
+
+        try:
+            subprocess_environment = os.environ.copy()
+            subprocess_environment[_PARENT_SYS_PATH_ENV] = json.dumps(
+                [os.fspath(entry) for entry in sys.path]
+            )
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(_EVALUATION_WORKER),
+                self.evaluation_file,
+                function_name,
+                os.path.abspath(program_path),
+                result_path,
+                str(os.getpid()),
+                env=subprocess_environment,
+                start_new_session=(os.name == "posix"),
+            )
+
+            if self.config.timeout is None:
+                await process.wait()
+            else:
+                elapsed = time.monotonic() - started_at
+                remaining = max(0.0, float(self.config.timeout) - elapsed)
+                await asyncio.wait_for(process.wait(), timeout=remaining)
+
+            # A candidate may have spawned descendants and returned without
+            # cleaning them up.  Keep the isolation boundary process-scoped,
+            # even for an otherwise successful evaluator result.
+            if os.name == "posix" and _process_group_exists(process.pid):
+                await _terminate_evaluation_process(process)
+
+            if process.returncode != 0:
+                raise IsolatedEvaluationError(
+                    "Isolated evaluator process exited without a result "
+                    f"(function={function_name!r}, exit_code={process.returncode})"
+                )
+
+            try:
+                with open(result_path, "rb") as result_file:
+                    envelope = pickle.load(result_file)
+            except Exception as exc:
+                raise IsolatedEvaluationError(
+                    "Could not read the isolated evaluator result "
+                    f"for function {function_name!r}: {exc}"
+                ) from exc
+
+            if not isinstance(envelope, dict):
+                raise IsolatedEvaluationError(
+                    f"Invalid isolated evaluator response type: {type(envelope).__name__}"
+                )
+            if envelope.get("protocol_version") != _ISOLATION_PROTOCOL_VERSION:
+                raise IsolatedEvaluationError(
+                    "Unsupported isolated evaluator protocol version: "
+                    f"{envelope.get('protocol_version')!r}"
+                )
+
+            status = envelope.get("status")
+            if status == "ok":
+                return envelope.get("result")
+            if status == "error":
+                _raise_remote_evaluation_error(envelope)
+            raise IsolatedEvaluationError(
+                f"Invalid isolated evaluator response status: {status!r}"
+            )
+
+        except asyncio.TimeoutError:
+            if process is not None:
+                await _terminate_evaluation_process(process)
+            raise
+        except BaseException:
+            if process is not None and (
+                process.returncode is None
+                or (os.name == "posix" and _process_group_exists(process.pid))
+            ):
+                await _terminate_evaluation_process(process)
+            raise
+        finally:
+            try:
+                os.unlink(result_path)
+            except FileNotFoundError:
+                pass
 
     async def _cascade_evaluate(
         self, program_path: str
@@ -399,11 +601,10 @@ class Evaluator:
             # Run first stage with timeout
             try:
 
-                async def run_stage1():
-                    loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(None, module.evaluate_stage1, program_path)
-
-                stage1_result = await asyncio.wait_for(run_stage1(), timeout=self.config.timeout)
+                stage1_result = await self._run_isolated_evaluation(
+                    program_path,
+                    "evaluate_stage1",
+                )
                 stage1_eval_result = self._process_evaluation_result(stage1_result)
             except asyncio.TimeoutError:
                 logger.warning(f"Stage 1 evaluation timed out after {self.config.timeout}s")
@@ -440,11 +641,10 @@ class Evaluator:
             # Run second stage with timeout
             try:
 
-                async def run_stage2():
-                    loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(None, module.evaluate_stage2, program_path)
-
-                stage2_result = await asyncio.wait_for(run_stage2(), timeout=self.config.timeout)
+                stage2_result = await self._run_isolated_evaluation(
+                    program_path,
+                    "evaluate_stage2",
+                )
                 stage2_eval_result = self._process_evaluation_result(stage2_result)
             except asyncio.TimeoutError:
                 logger.warning(f"Stage 2 evaluation timed out after {self.config.timeout}s")
@@ -502,11 +702,10 @@ class Evaluator:
             # Run third stage with timeout
             try:
 
-                async def run_stage3():
-                    loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(None, module.evaluate_stage3, program_path)
-
-                stage3_result = await asyncio.wait_for(run_stage3(), timeout=self.config.timeout)
+                stage3_result = await self._run_isolated_evaluation(
+                    program_path,
+                    "evaluate_stage3",
+                )
                 stage3_eval_result = self._process_evaluation_result(stage3_result)
             except asyncio.TimeoutError:
                 logger.warning(f"Stage 3 evaluation timed out after {self.config.timeout}s")
