@@ -3,8 +3,10 @@ Program database for OpenEvolve
 """
 
 import base64
+from bisect import bisect_right
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -22,6 +24,10 @@ from openevolve.utils.code_utils import calculate_edit_distance
 from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidFeatureDescriptorError(ValueError):
+    """A configured fixed-grid descriptor cannot be assigned to a physical bin."""
 
 
 def _safe_sum_metrics(metrics: Dict[str, Any]) -> float:
@@ -123,6 +129,9 @@ class ProgramDatabase:
 
     def __init__(self, config: DatabaseConfig):
         self.config = config
+        # Config objects are frequently mutated directly in library/tests after
+        # dataclass construction, so validate the effective edge schema here too.
+        config.validate_feature_bin_edges()
 
         # In-memory program storage
         self.programs: Dict[str, Program] = {}
@@ -139,6 +148,31 @@ class ProgramDatabase:
         else:
             # If dict, keep as is (we'll use feature_bins_per_dim instead)
             self.feature_bins = 10  # Default fallback for backward compatibility
+
+        # Fixed edges override legacy bin counts only for their dimensions. Other
+        # dimensions continue to use dynamic scaling and feature_bins unchanged.
+        self.feature_bin_edges: Dict[str, Tuple[float, ...]] = {
+            dim: tuple(edges) for dim, edges in config.feature_bin_edges.items()
+        }
+        if isinstance(config.feature_bins, dict):
+            self.feature_bins_per_dim = {
+                dim: config.feature_bins.get(dim, self.feature_bins)
+                for dim in config.feature_dimensions
+            }
+        else:
+            self.feature_bins_per_dim = {
+                dim: self.feature_bins for dim in config.feature_dimensions
+            }
+        for dim, edges in self.feature_bin_edges.items():
+            self.feature_bins_per_dim[dim] = len(edges) + 1
+        self.total_feature_cells = math.prod(
+            self.feature_bins_per_dim[dim] for dim in config.feature_dimensions
+        )
+
+        # Dynamic dimensions maintain observed statistics. Fixed dimensions never
+        # populate this structure and are independent of population history.
+        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
+        self.feature_scaling_method: str = "minmax"  # Options: minmax, zscore, percentile
 
         # Island populations
         self.islands: List[Set[str]] = [set() for _ in range(config.num_islands)]
@@ -186,19 +220,6 @@ class ProgramDatabase:
         )  # Reference program codes for consistent diversity
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
-        # Feature scaling infrastructure
-        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
-        self.feature_scaling_method: str = "minmax"  # Options: minmax, zscore, percentile
-
-        # Per-dimension bins support
-        if hasattr(config, "feature_bins") and isinstance(config.feature_bins, dict):
-            self.feature_bins_per_dim = config.feature_bins
-        else:
-            # Backward compatibility - use same bins for all dimensions
-            self.feature_bins_per_dim = {
-                dim: self.feature_bins for dim in config.feature_dimensions
-            }
-
         logger.info(f"Initialized program database with {len(self.programs)} programs")
 
         # Novelty judge setup
@@ -233,10 +254,20 @@ class ProgramDatabase:
 
         self.programs[program.id] = program
 
-        # Calculate feature coordinates for MAP-Elites
-        feature_coords = self._calculate_feature_coords(program)
-        # Preserve the insertion-time coordinate before normalization ranges evolve.
-        program.metadata["map_elites_cell"] = list(feature_coords)
+        # Calculate feature coordinates for MAP-Elites. A non-finite or missing
+        # descriptor for a fixed dimension is explicitly left unmapped instead of
+        # being clipped into a scientifically meaningful cell.
+        try:
+            feature_coords: Optional[List[int]] = self._calculate_feature_coords(program)
+        except InvalidFeatureDescriptorError as exc:
+            feature_coords = None
+            program.metadata["map_elites_cell"] = None
+            program.metadata["map_elites_invalid_descriptor"] = str(exc)
+            logger.warning("Program %s has no MAP-Elites cell: %s", program.id, exc)
+        else:
+            # Preserve the insertion-time coordinate before any dynamic ranges evolve.
+            program.metadata["map_elites_cell"] = list(feature_coords)
+            program.metadata.pop("map_elites_invalid_descriptor", None)
 
         # Determine target island
         # If target_island is not specified and program has a parent, inherit parent's island
@@ -276,11 +307,15 @@ class ProgramDatabase:
             return program.id  # Do not add non-novel program
 
         # Add to island-specific feature map (replacing existing if better)
-        feature_key = self._feature_coords_to_key(feature_coords)
         island_feature_map = self.island_feature_maps[island_idx]
-        should_replace = feature_key not in island_feature_map
+        feature_key = (
+            self._feature_coords_to_key(feature_coords)
+            if feature_coords is not None
+            else None
+        )
+        should_replace = feature_key is not None and feature_key not in island_feature_map
 
-        if not should_replace:
+        if feature_key is not None and not should_replace:
             # Check if the existing program still exists before comparing
             existing_program_id = island_feature_map[feature_key]
             if existing_program_id not in self.programs:
@@ -310,7 +345,7 @@ class ProgramDatabase:
                     "New MAP-Elites cell occupied in island %d: %s", island_idx, coords_dict
                 )
                 # Check coverage milestone for this island
-                total_possible_cells = self.feature_bins ** len(self.config.feature_dimensions)
+                total_possible_cells = self.total_feature_cells
                 island_coverage = (len(island_feature_map) + 1) / total_possible_cells
                 if island_coverage in [0.1, 0.25, 0.5, 0.75, 0.9]:
                     logger.info(
@@ -657,12 +692,59 @@ class ProgramDatabase:
             "island_generations": self.island_generations,
             "last_migration_generation": self.last_migration_generation,
             "feature_stats": self._serialize_feature_stats(),
+            "map_elites_config": self._map_elites_config(),
         }
 
         with open(os.path.join(save_path, "metadata.json"), "w") as f:
             json.dump(metadata, f)
 
         logger.info(f"Saved database with {len(self.programs)} programs to {save_path}")
+
+    def _map_elites_config(self) -> Dict[str, Any]:
+        """Return the normalized grid definition that gives saved cells meaning."""
+
+        return {
+            "version": 1,
+            "feature_dimensions": list(self.config.feature_dimensions),
+            "feature_bins_per_dim": {
+                dim: self.feature_bins_per_dim[dim]
+                for dim in self.config.feature_dimensions
+            },
+            "feature_bin_edges": {
+                dim: list(self.feature_bin_edges[dim])
+                for dim in self.config.feature_dimensions
+                if dim in self.feature_bin_edges
+            },
+        }
+
+    def _validate_checkpoint_map_elites_config(
+        self,
+        saved_config: Any,
+        saved_feature_maps: Any,
+    ) -> None:
+        """Prevent a resume from mixing cells created by incompatible grids."""
+
+        if saved_config is None:
+            has_saved_cells = isinstance(saved_feature_maps, list) and any(
+                isinstance(feature_map, dict) and feature_map
+                for feature_map in saved_feature_maps
+            )
+            if has_saved_cells and self.feature_bin_edges:
+                raise ValueError(
+                    "Cannot resume an occupied legacy checkpoint with fixed "
+                    "feature_bin_edges because the checkpoint does not record the "
+                    "grid definition used for its existing cells"
+                )
+            return
+
+        if not isinstance(saved_config, dict):
+            raise ValueError("Checkpoint map_elites_config must be a mapping")
+        current_config = self._map_elites_config()
+        if saved_config != current_config:
+            raise ValueError(
+                "Checkpoint MAP-Elites grid does not match the configured grid: "
+                f"saved={saved_config!r}, configured={current_config!r}"
+            )
 
     def load(self, path: str) -> None:
         """
@@ -682,9 +764,14 @@ class ProgramDatabase:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
 
-            self.island_feature_maps = metadata.get(
+            saved_feature_maps = metadata.get(
                 "island_feature_maps", [{} for _ in range(self.config.num_islands)]
             )
+            self._validate_checkpoint_map_elites_config(
+                metadata.get("map_elites_config"),
+                saved_feature_maps,
+            )
+            self.island_feature_maps = saved_feature_maps
             saved_islands = metadata.get("islands", [])
             self.archive = set(metadata.get("archive", []))
             self.best_program_id = metadata.get("best_program_id")
@@ -877,13 +964,7 @@ class ProgramDatabase:
             if dim in program.metrics:
                 # Use custom metric from evaluator
                 score = program.metrics[dim]
-                # Update stats and scale
-                self._update_feature_stats(dim, score)
-                scaled_value = self._scale_feature_value(dim, score)
-                num_bins = self.feature_bins_per_dim.get(dim, self.feature_bins)
-                bin_idx = int(scaled_value * num_bins)
-                bin_idx = max(0, min(num_bins - 1, bin_idx))
-                coords.append(bin_idx)
+                coords.append(self._calculate_feature_bin(dim, score))
             # PRIORITY 2: Fall back to built-in features if not in metrics
             elif dim == "complexity":
                 # Use code length as complexity measure
@@ -893,7 +974,13 @@ class ProgramDatabase:
             elif dim == "diversity":
                 # Use cached diversity calculation with reference set
                 if len(self.programs) < 2:
-                    bin_idx = 0
+                    # Keep the historical bootstrap cell for legacy dynamic
+                    # grids. Fixed grids still bin the physical value 0.0.
+                    bin_idx = (
+                        self._calculate_diversity_bin(0.0)
+                        if dim in self.feature_bin_edges
+                        else 0
+                    )
                 else:
                     diversity = self._get_cached_diversity(program)
                     bin_idx = self._calculate_diversity_bin(diversity)
@@ -901,19 +988,24 @@ class ProgramDatabase:
             elif dim == "score":
                 # Use average of numeric metrics
                 if not program.metrics:
-                    bin_idx = 0
+                    # Preserve the pre-existing empty-metrics bootstrap cell
+                    # when explicit physical edges are not configured.
+                    bin_idx = (
+                        self._calculate_feature_bin("score", 0.0)
+                        if dim in self.feature_bin_edges
+                        else 0
+                    )
                 else:
                     # Use fitness score for "score" dimension (consistent with rest of system)
                     avg_score = get_fitness_score(program.metrics, self.config.feature_dimensions)
-                    # Update stats and scale
-                    self._update_feature_stats("score", avg_score)
-                    scaled_value = self._scale_feature_value("score", avg_score)
-                    num_bins = self.feature_bins_per_dim.get("score", self.feature_bins)
-                    bin_idx = int(scaled_value * num_bins)
-                    bin_idx = max(0, min(num_bins - 1, bin_idx))
+                    bin_idx = self._calculate_feature_bin("score", avg_score)
                 coords.append(bin_idx)
             else:
                 # Feature not found - this is an error
+                if dim in self.feature_bin_edges:
+                    raise InvalidFeatureDescriptorError(
+                        f"fixed feature dimension {dim!r} is missing from program metrics"
+                    )
                 raise ValueError(
                     f"Feature dimension '{dim}' specified in config but not found in program metrics. "
                     f"Available metrics: {list(program.metrics.keys())}. "
@@ -927,6 +1019,36 @@ class ProgramDatabase:
         )
         return coords
 
+    def _calculate_feature_bin(self, dimension: str, value: Any) -> int:
+        """Bin one raw feature using fixed edges or legacy dynamic scaling."""
+
+        fixed_edges = self.feature_bin_edges.get(dimension)
+        if fixed_edges is not None:
+            if isinstance(value, bool):
+                raise InvalidFeatureDescriptorError(
+                    f"fixed feature dimension {dimension!r} is not numeric"
+                )
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise InvalidFeatureDescriptorError(
+                    f"fixed feature dimension {dimension!r} is not numeric"
+                ) from exc
+            if not math.isfinite(numeric_value):
+                raise InvalidFeatureDescriptorError(
+                    f"fixed feature dimension {dimension!r} is not finite"
+                )
+            # bisect_right implements: < e0, e0 <= x < e1, ..., x >= eN.
+            return bisect_right(fixed_edges, numeric_value)
+
+        # Preserve the existing observed-range behavior for dimensions without
+        # explicit edges.
+        self._update_feature_stats(dimension, value)
+        scaled_value = self._scale_feature_value(dimension, value)
+        num_bins = self.feature_bins_per_dim.get(dimension, self.feature_bins)
+        bin_idx = int(scaled_value * num_bins)
+        return max(0, min(num_bins - 1, bin_idx))
+
     def _calculate_complexity_bin(self, complexity: int) -> int:
         """
         Calculate the bin index for a given complexity value using feature scaling.
@@ -937,22 +1059,7 @@ class ProgramDatabase:
         Returns:
             Bin index in range [0, self.feature_bins - 1]
         """
-        # Update feature statistics
-        self._update_feature_stats("complexity", float(complexity))
-
-        # Scale the value using configured method
-        scaled_value = self._scale_feature_value("complexity", float(complexity))
-
-        # Get number of bins for this dimension
-        num_bins = self.feature_bins_per_dim.get("complexity", self.feature_bins)
-
-        # Convert to bin index
-        bin_idx = int(scaled_value * num_bins)
-
-        # Ensure bin index is within valid range
-        bin_idx = max(0, min(num_bins - 1, bin_idx))
-
-        return bin_idx
+        return self._calculate_feature_bin("complexity", float(complexity))
 
     def _calculate_diversity_bin(self, diversity: float) -> int:
         """
@@ -964,22 +1071,7 @@ class ProgramDatabase:
         Returns:
             Bin index in range [0, self.feature_bins - 1]
         """
-        # Update feature statistics
-        self._update_feature_stats("diversity", diversity)
-
-        # Scale the value using configured method
-        scaled_value = self._scale_feature_value("diversity", diversity)
-
-        # Get number of bins for this dimension
-        num_bins = self.feature_bins_per_dim.get("diversity", self.feature_bins)
-
-        # Convert to bin index
-        bin_idx = int(scaled_value * num_bins)
-
-        # Ensure bin index is within valid range
-        bin_idx = max(0, min(num_bins - 1, bin_idx))
-
-        return bin_idx
+        return self._calculate_feature_bin("diversity", diversity)
 
     def _feature_coords_to_key(self, coords: List[int]) -> str:
         """
@@ -1672,24 +1764,45 @@ class ProgramDatabase:
             remaining_slots = n - len(inspirations)
 
             # Try to sample from different feature cells within the island
-            feature_coords = self._calculate_feature_coords(parent)
             nearby_programs = []
 
-            # Create a mapping of feature cells to island programs for efficient lookup
-            island_feature_map = {}
-            for prog_id in island_program_ids:
-                if prog_id in self.programs:
-                    prog = self.programs[prog_id]
-                    prog_coords = self._calculate_feature_coords(prog)
-                    cell_key = self._feature_coords_to_key(prog_coords)
-                    island_feature_map[cell_key] = prog_id
+            if self.feature_bin_edges:
+                # Fixed/mixed grids use insertion-time coordinates and the
+                # authoritative island map. Invalid descriptors have no cell.
+                stored_coords = parent.metadata.get("map_elites_cell")
+                feature_coords = (
+                    list(stored_coords)
+                    if isinstance(stored_coords, (list, tuple))
+                    and len(stored_coords) == len(self.config.feature_dimensions)
+                    else None
+                )
+                island_feature_map = dict(self.island_feature_maps[parent_island])
+            else:
+                # Preserve legacy dynamic inspiration sampling exactly.
+                feature_coords = self._calculate_feature_coords(parent)
+                island_feature_map = {}
+                for prog_id in island_program_ids:
+                    if prog_id in self.programs:
+                        prog = self.programs[prog_id]
+                        prog_coords = self._calculate_feature_coords(prog)
+                        cell_key = self._feature_coords_to_key(prog_coords)
+                        island_feature_map[cell_key] = prog_id
 
             # Try to find programs from nearby feature cells within the island
-            for _ in range(remaining_slots * 3):  # Try more times to find nearby programs
+            for _ in range(remaining_slots * 3 if feature_coords is not None else 0):
                 # Perturb coordinates
                 perturbed_coords = [
-                    max(0, min(self.feature_bins - 1, c + random.randint(-2, 2)))
-                    for c in feature_coords
+                    max(
+                        0,
+                        min(
+                            self.feature_bins_per_dim[dimension] - 1,
+                            coordinate + random.randint(-2, 2),
+                        ),
+                    )
+                    for dimension, coordinate in zip(
+                        self.config.feature_dimensions,
+                        feature_coords,
+                    )
                 ]
 
                 cell_key = self._feature_coords_to_key(perturbed_coords)

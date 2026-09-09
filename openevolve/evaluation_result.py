@@ -17,7 +17,8 @@ class EvaluationResult:
 
     IMPORTANT: For custom MAP-Elites features, metrics values must be raw continuous
     scores (e.g., actual counts, percentages, continuous measurements), NOT pre-computed
-    bin indices. The database handles all binning internally using min-max scaling.
+    bin indices. The database handles binning internally using configured physical
+    edges when present, or legacy min-max scaling otherwise.
 
     Examples:
         ✅ Correct: {"combined_score": 0.85, "prompt_length": 1247, "execution_time": 0.234}

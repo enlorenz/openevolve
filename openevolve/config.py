@@ -2,6 +2,7 @@
 Configuration handling for OpenEvolve
 """
 
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -349,6 +350,14 @@ class DatabaseConfig:
         },
     )
     feature_bins: Union[int, Dict[str, int]] = 10  # Can be int (all dims) or dict (per-dim)
+    feature_bin_edges: Dict[str, List[float]] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Optional fixed physical bin edges keyed by feature dimension. "
+            "A dimension with N strictly increasing finite edges has N+1 bins; "
+            "dimensions without edges retain legacy dynamic normalization."
+        },
+    )
     diversity_reference_size: int = 20  # Size of reference set for diversity calculation
 
     # Migration parameters for island-based evolution
@@ -370,6 +379,58 @@ class DatabaseConfig:
     novelty_llm: Optional["LLMInterface"] = None
     embedding_model: Optional[str] = None
     similarity_threshold: float = 0.99
+
+    def __post_init__(self) -> None:
+        """Validate and normalize optional fixed MAP-Elites bin edges."""
+
+        self.validate_feature_bin_edges()
+
+    def validate_feature_bin_edges(self) -> None:
+        """Validate edges again after callers may have mutated the config."""
+
+        normalized_edges: Dict[str, List[float]] = {}
+        configured_by_dimension = self.feature_bin_edges
+        if configured_by_dimension is None:
+            configured_by_dimension = {}
+        if not isinstance(configured_by_dimension, dict):
+            raise ValueError("feature_bin_edges must be a mapping keyed by feature dimension")
+
+        for dimension, configured_edges in configured_by_dimension.items():
+            if dimension not in self.feature_dimensions:
+                raise ValueError(
+                    f"feature_bin_edges dimension {dimension!r} is not present in "
+                    "feature_dimensions"
+                )
+            if not isinstance(configured_edges, (list, tuple)) or not configured_edges:
+                raise ValueError(
+                    f"feature_bin_edges[{dimension!r}] must contain at least one edge"
+                )
+
+            edges: List[float] = []
+            for edge in configured_edges:
+                if isinstance(edge, bool):
+                    raise ValueError(
+                        f"feature_bin_edges[{dimension!r}] must contain only finite numbers"
+                    )
+                try:
+                    numeric_edge = float(edge)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"feature_bin_edges[{dimension!r}] must contain only finite numbers"
+                    ) from exc
+                if not math.isfinite(numeric_edge):
+                    raise ValueError(
+                        f"feature_bin_edges[{dimension!r}] must contain only finite numbers"
+                    )
+                edges.append(numeric_edge)
+
+            if any(right <= left for left, right in zip(edges, edges[1:])):
+                raise ValueError(
+                    f"feature_bin_edges[{dimension!r}] must be strictly increasing"
+                )
+            normalized_edges[dimension] = edges
+
+        self.feature_bin_edges = normalized_edges
 
 
 @dataclass
