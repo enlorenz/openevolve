@@ -245,8 +245,15 @@ class ProgramDatabase:
         Returns:
             Program ID
         """
+        # Program IDs identify active genotypes and every role stores only the ID.
+        # Reusing one would overwrite the live object before replacement preflight
+        # and could leave dangling MAP/island/best references on failure.
+        if program.id in self.programs:
+            raise ValueError(f"Program ID {program.id!r} is already active")
+
         # Store the program
         # If iteration is provided, update the program's iteration_found
+        previous_last_iteration = self.last_iteration
         if iteration is not None:
             program.iteration_found = iteration
             # Update last_iteration if needed
@@ -257,6 +264,13 @@ class ProgramDatabase:
         # Calculate feature coordinates for MAP-Elites. A non-finite or missing
         # descriptor for a fixed dimension is explicitly left unmapped instead of
         # being clipped into a scientifically meaningful cell.
+        previous_feature_stats = {
+            feature_name: {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in stats.items()
+            }
+            for feature_name, stats in self.feature_stats.items()
+        }
         try:
             feature_coords: Optional[List[int]] = self._calculate_feature_coords(program)
         except InvalidFeatureDescriptorError as exc:
@@ -306,33 +320,82 @@ class ProgramDatabase:
             )
             return program.id  # Do not add non-novel program
 
-        # Add to island-specific feature map (replacing existing if better)
+        # Add to island-specific feature map. Live cell replacements are handled
+        # atomically by _replace_cell_incumbent so every ID-bearing role moves
+        # together and the displaced program is retired before population
+        # enforcement.
         island_feature_map = self.island_feature_maps[island_idx]
         feature_key = (
             self._feature_coords_to_key(feature_coords)
             if feature_coords is not None
             else None
         )
-        should_replace = feature_key is not None and feature_key not in island_feature_map
+        should_install_in_cell = feature_key is not None and feature_key not in island_feature_map
+        incumbent_id: Optional[str] = None
+        replacement_kind: Optional[str] = None
 
-        if feature_key is not None and not should_replace:
-            # Check if the existing program still exists before comparing
-            existing_program_id = island_feature_map[feature_key]
-            if existing_program_id not in self.programs:
-                # Stale reference, replace it
-                should_replace = True
+        if feature_key is not None and not should_install_in_cell:
+            incumbent_id = island_feature_map[feature_key]
+            incumbent = self.programs.get(incumbent_id)
+            if incumbent is None:
+                # Stale reference: there is no live incumbent whose roles need
+                # transferring. Purge that nonexistent ID from every auxiliary
+                # active index before installing the newcomer in this cell.
+                should_install_in_cell = True
                 logger.debug(
-                    f"Replacing stale program reference {existing_program_id} in island {island_idx} feature map"
+                    "Replacing stale program reference %s in island %d feature map",
+                    incumbent_id,
+                    island_idx,
                 )
+                for stale_island in self.islands:
+                    stale_island.discard(incumbent_id)
+                self.archive.discard(incumbent_id)
+                if self.best_program_id == incumbent_id:
+                    self.best_program_id = None
+                for best_island_idx, best_id in enumerate(self.island_best_programs):
+                    if best_id == incumbent_id:
+                        self.island_best_programs[best_island_idx] = None
+                for map_island_idx, feature_map in enumerate(self.island_feature_maps):
+                    stale_keys = [
+                        key
+                        for key, program_id in feature_map.items()
+                        if program_id == incumbent_id
+                        and not (map_island_idx == island_idx and key == feature_key)
+                    ]
+                    for stale_key in stale_keys:
+                        del feature_map[stale_key]
+                if self.prompts_by_program is not None:
+                    self.prompts_by_program.pop(incumbent_id, None)
             else:
-                # Program exists, compare fitness
-                should_replace = self._is_better(program, self.programs[existing_program_id])
+                new_fitness = get_fitness_score(
+                    program.metrics, self.config.feature_dimensions
+                )
+                incumbent_fitness = get_fitness_score(
+                    incumbent.metrics, self.config.feature_dimensions
+                )
+                is_exact_finite_tie = (
+                    math.isfinite(new_fitness)
+                    and math.isfinite(incumbent_fitness)
+                    and new_fitness == incumbent_fitness
+                )
+                if (
+                    program.id != incumbent.id
+                    and program.code != incumbent.code
+                    and is_exact_finite_tie
+                ):
+                    should_install_in_cell = True
+                    replacement_kind = "neutral"
+                elif not is_exact_finite_tie and self._is_better(program, incumbent):
+                    # Exact finite ties are handled exclusively by the neutral
+                    # predicate above. In particular, _is_better's legacy
+                    # timestamp fallback for empty metrics must not turn a tie or
+                    # identical-code duplicate into a strict replacement.
+                    should_install_in_cell = True
+                    replacement_kind = "strict"
 
-        # Track a program that gets displaced from its cell so we can remove it
-        # from the population if it ends up orphaned (owning no cell, in no island).
-        replaced_program_id = None
+        replacement_event: Optional[Dict[str, Any]] = None
 
-        if should_replace:
+        if should_install_in_cell:
             # Log significant MAP-Elites events
             coords_dict = {
                 self.config.feature_dimensions[i]: feature_coords[i]
@@ -355,46 +418,69 @@ class ProgramDatabase:
                         len(island_feature_map) + 1,
                         total_possible_cells,
                     )
-            else:
-                # Cell replacement - existing program being replaced in this island
-                existing_program_id = island_feature_map[feature_key]
-                if existing_program_id in self.programs:
-                    existing_program = self.programs[existing_program_id]
-                    new_fitness = get_fitness_score(program.metrics, self.config.feature_dimensions)
-                    existing_fitness = get_fitness_score(
-                        existing_program.metrics, self.config.feature_dimensions
+                island_feature_map[feature_key] = program.id
+            elif replacement_kind is not None and incumbent_id is not None:
+                # A live cell incumbent is being replaced. Preflight and transfer
+                # all active roles before population enforcement.
+                try:
+                    replacement_event = self._replace_cell_incumbent(
+                        incumbent_id=incumbent_id,
+                        newcomer=program,
+                        island_idx=island_idx,
+                        feature_key=feature_key,
+                        replacement_kind=replacement_kind,
                     )
+                except Exception:
+                    # The newcomer has not acquired any active role if preflight
+                    # fails. Remove its initial programs entry so malformed state
+                    # cannot produce a partial replacement.
+                    if self.programs.get(program.id) is program:
+                        del self.programs[program.id]
+                    if "diversity" in self.config.feature_dimensions:
+                        self.diversity_cache.clear()
+                        self.diversity_reference_set = []
+                    self.feature_stats = previous_feature_stats
+                    self.last_iteration = previous_last_iteration
+                    raise
+
+                old_fitness = get_fitness_score(
+                    incumbent.metrics, self.config.feature_dimensions
+                )
+                new_fitness = replacement_event["exact_fitness"]
+                if replacement_kind == "neutral":
+                    logger.info(
+                        "Island %d MAP-Elites neutral supersession: %s "
+                        "(%s -> %s, fitness unchanged at %.3f)",
+                        island_idx,
+                        coords_dict,
+                        incumbent_id,
+                        program.id,
+                        new_fitness,
+                    )
+                else:
                     logger.info(
                         "Island %d MAP-Elites cell improved: %s (fitness: %.3f -> %.3f)",
                         island_idx,
                         coords_dict,
-                        existing_fitness,
+                        old_fitness,
                         new_fitness,
                     )
+            else:
+                # A stale map entry is replaced without a live incumbent.
+                island_feature_map[feature_key] = program.id
 
-                    # use MAP-Elites to manage archive
-                    if existing_program_id in self.archive:
-                        self.archive.discard(existing_program_id)
-                        self.archive.add(program.id)
-
-                # Remove replaced program from island set to keep it consistent with feature map
-                # This prevents accumulation of stale/replaced programs in the island
-                self.islands[island_idx].discard(existing_program_id)
-                replaced_program_id = existing_program_id
-
-            island_feature_map[feature_key] = program.id
-
-        # Add to island
-        self.islands[island_idx].add(program.id)
-
-        # Track which island this program belongs to
-        program.metadata["island"] = island_idx
+        if replacement_event is None:
+            # New cells and non-winning candidates follow the ordinary admission
+            # path. The replacement helper already performs these assignments for
+            # live strict/neutral replacements.
+            self.islands[island_idx].add(program.id)
+            program.metadata["island"] = island_idx
 
         # Update archive
         self._update_archive(program)
 
-        # Enforce population size limit BEFORE updating best program tracking
-        # This ensures newly added programs aren't immediately removed
+        # A displaced incumbent has already been retired by the helper, avoiding
+        # a temporary N+1 population and unrelated eviction/under-population.
         self._enforce_population_limit(exclude_program_id=program.id)
 
         # Update the absolute best program tracking (after population enforcement)
@@ -402,19 +488,6 @@ class ProgramDatabase:
 
         # Update island-specific best program tracking
         self._update_island_best_program(program, island_idx)
-
-        # If a program was displaced from its cell by this addition, it may now be
-        # orphaned - owning no cell and belonging to no island. Such a program is a
-        # "zombie" that consumes a population slot but can never be sampled again, so
-        # remove it. This runs after best-program tracking is updated so the newly
-        # added (better) program is already recorded as best, ensuring we never drop
-        # the current best program here.
-        if (
-            replaced_program_id is not None
-            and replaced_program_id != program.id
-            and replaced_program_id != self.best_program_id
-        ):
-            self._remove_program_if_orphaned(replaced_program_id)
 
         # Save to disk if configured
         if self.config.db_path:
@@ -682,6 +755,7 @@ class ProgramDatabase:
 
         # Save metadata
         metadata = {
+            "active_program_ids": sorted(self.programs),
             "island_feature_maps": self.island_feature_maps,
             "islands": [list(island) for island in self.islands],
             "archive": list(self.archive),
@@ -760,6 +834,7 @@ class ProgramDatabase:
         # Load metadata first
         metadata_path = os.path.join(path, "metadata.json")
         saved_islands = []
+        active_program_ids: Optional[Set[str]] = None
         if os.path.exists(metadata_path):
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
@@ -783,6 +858,37 @@ class ProgramDatabase:
             self.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
             self.last_migration_generation = metadata.get("last_migration_generation", 0)
 
+            # Modern checkpoints explicitly identify the live population. Program
+            # JSON files are intentionally not deleted when a genotype retires, so
+            # the manifest prevents those historical files from being resurrected.
+            # Absence of this field remains the legacy "load every JSON file"
+            # behavior; a present empty list means there are no active programs.
+            if "active_program_ids" in metadata:
+                saved_active_ids = metadata["active_program_ids"]
+                if not isinstance(saved_active_ids, list) or not all(
+                    isinstance(program_id, str) for program_id in saved_active_ids
+                ):
+                    raise ValueError(
+                        "Checkpoint active_program_ids must be a list of strings"
+                    )
+                active_program_ids = set(saved_active_ids)
+                self.programs = {
+                    program_id: program
+                    for program_id, program in self.programs.items()
+                    if program_id in active_program_ids
+                }
+                if (
+                    hasattr(self, "prompts_by_program")
+                    and self.prompts_by_program is not None
+                ):
+                    self.prompts_by_program = {
+                        program_id: prompts
+                        for program_id, prompts in self.prompts_by_program.items()
+                        if program_id in active_program_ids
+                    }
+                if hasattr(self, "diversity_cache"):
+                    self._invalidate_diversity_cache()
+
             # Load feature_stats for MAP-Elites grid stability
             self.feature_stats = self._deserialize_feature_stats(metadata.get("feature_stats", {}))
 
@@ -801,6 +907,11 @@ class ProgramDatabase:
                             program_data = json.load(f)
 
                         program = Program.from_dict(program_data)
+                        if (
+                            active_program_ids is not None
+                            and program.id not in active_program_ids
+                        ):
+                            continue
                         self.programs[program.id] = program
                     except Exception as e:
                         logger.warning(f"Error loading program {program_file}: {str(e)}")
@@ -1253,6 +1364,13 @@ class ProgramDatabase:
         Args:
             program: Program to consider for archive
         """
+        # Cell replacement may already have transferred the incumbent's archive
+        # role to this exact ID. Treat that as a completed admission: reconsidering
+        # an already-present member in a full archive can evict an unrelated third
+        # program and shrink the archive because set insertion is idempotent.
+        if program.id in self.archive:
+            return
+
         # If archive not full, add program
         if len(self.archive) < self.config.archive_size:
             self.archive.add(program.id)
@@ -1851,6 +1969,321 @@ class ProgramDatabase:
 
         return inspirations[:n]
 
+    def _replace_cell_incumbent(
+        self,
+        incumbent_id: str,
+        newcomer: Program,
+        island_idx: int,
+        feature_key: str,
+        replacement_kind: str,
+    ) -> Dict[str, Any]:
+        """Atomically transfer one MAP-cell incumbent's active roles.
+
+        The displaced incumbent is not necessarily the newcomer's lineage parent.
+        This helper therefore records a separate MAP-Elites replacement event and
+        deliberately leaves ``parent_id`` and all other lineage fields untouched.
+
+        Args:
+            incumbent_id: Live ID currently owning ``feature_key``.
+            newcomer: Newly evaluated program that will own the cell.
+            island_idx: Island containing the cell and incumbent.
+            feature_key: Internal MAP-Elites coordinate key.
+            replacement_kind: Either ``"strict"`` or ``"neutral"``.
+
+        Returns:
+            A JSON-serializable structured replacement event.
+
+        Raises:
+            ValueError: If active-state invariants are malformed. All checks run
+                before role mutation so callers can safely discard the newcomer.
+        """
+        if replacement_kind not in {"strict", "neutral"}:
+            raise ValueError(f"Unsupported cell replacement kind: {replacement_kind!r}")
+        if not 0 <= island_idx < len(self.islands):
+            raise ValueError(f"Invalid replacement island index: {island_idx}")
+        if incumbent_id == newcomer.id:
+            raise ValueError("Cell replacement requires distinct program IDs")
+        if incumbent_id not in self.programs:
+            raise ValueError(f"Cell incumbent {incumbent_id} is not live")
+        if self.programs.get(newcomer.id) is not newcomer:
+            raise ValueError(f"Cell newcomer {newcomer.id} is not the live program object")
+
+        island_map = self.island_feature_maps[island_idx]
+        if island_map.get(feature_key) != incumbent_id:
+            raise ValueError(
+                f"Cell {feature_key!r} in island {island_idx} no longer belongs to "
+                f"incumbent {incumbent_id}"
+            )
+
+        incumbent_cells = [
+            (map_island_idx, key)
+            for map_island_idx, feature_map in enumerate(self.island_feature_maps)
+            for key, program_id in feature_map.items()
+            if program_id == incumbent_id
+        ]
+        if incumbent_cells != [(island_idx, feature_key)]:
+            raise ValueError(
+                f"Cell incumbent {incumbent_id} has malformed MAP roles: {incumbent_cells}"
+            )
+
+        incumbent_islands = [
+            member_island_idx
+            for member_island_idx, island in enumerate(self.islands)
+            if incumbent_id in island
+        ]
+        if incumbent_islands != [island_idx]:
+            raise ValueError(
+                f"Cell incumbent {incumbent_id} has malformed island roles: "
+                f"{incumbent_islands}"
+            )
+
+        incumbent = self.programs[incumbent_id]
+        if incumbent.metadata.get("island") != island_idx:
+            raise ValueError(
+                f"Cell incumbent {incumbent_id} metadata island "
+                f"{incumbent.metadata.get('island')!r} does not match {island_idx}"
+            )
+
+        stored_newcomer_cell = newcomer.metadata.get("map_elites_cell")
+        if not isinstance(stored_newcomer_cell, (list, tuple)) or (
+            self._feature_coords_to_key(list(stored_newcomer_cell)) != feature_key
+        ):
+            raise ValueError(
+                f"Cell newcomer {newcomer.id} does not map to {feature_key!r}"
+            )
+
+        incumbent_fitness = get_fitness_score(
+            incumbent.metrics, self.config.feature_dimensions
+        )
+        newcomer_fitness = get_fitness_score(
+            newcomer.metrics, self.config.feature_dimensions
+        )
+        if replacement_kind == "strict":
+            if (
+                math.isfinite(newcomer_fitness)
+                and math.isfinite(incumbent_fitness)
+                and newcomer_fitness == incumbent_fitness
+            ) or not self._is_better(newcomer, incumbent):
+                raise ValueError(
+                    f"Strict cell replacement {incumbent_id} -> {newcomer.id} "
+                    "does not improve fitness"
+                )
+        elif not (
+            newcomer.code != incumbent.code
+            and math.isfinite(newcomer_fitness)
+            and math.isfinite(incumbent_fitness)
+            and newcomer_fitness == incumbent_fitness
+        ):
+            raise ValueError(
+                f"Neutral cell replacement {incumbent_id} -> {newcomer.id} "
+                "requires different code and exactly equal finite fitness"
+            )
+
+        foreign_island_best_roles = [
+            best_island_idx
+            for best_island_idx, best_id in enumerate(self.island_best_programs)
+            if best_id == incumbent_id and best_island_idx != island_idx
+        ]
+        if foreign_island_best_roles:
+            raise ValueError(
+                f"Cell incumbent {incumbent_id} is best for unrelated islands: "
+                f"{foreign_island_best_roles}"
+            )
+
+        newcomer_active_roles = []
+        if any(newcomer.id in feature_map.values() for feature_map in self.island_feature_maps):
+            newcomer_active_roles.append("map")
+        if any(newcomer.id in island for island in self.islands):
+            newcomer_active_roles.append("island")
+        if newcomer.id in self.archive:
+            newcomer_active_roles.append("archive")
+        if self.best_program_id == newcomer.id:
+            newcomer_active_roles.append("global_best")
+        if newcomer.id in self.island_best_programs:
+            newcomer_active_roles.append("island_best")
+        if newcomer_active_roles:
+            raise ValueError(
+                f"Cell newcomer {newcomer.id} already has active roles: "
+                f"{newcomer_active_roles}"
+            )
+        if self.prompts_by_program is not None and not isinstance(
+            self.prompts_by_program, dict
+        ):
+            raise ValueError("Active prompt cache must be a dictionary or None")
+
+        archive_transferred = incumbent_id in self.archive
+        island_best_transferred = self.island_best_programs[island_idx] == incumbent_id
+        global_best_transferred = self.best_program_id == incumbent_id
+        combined_score_log: Optional[Tuple[float, float]] = None
+        if (
+            replacement_kind == "strict"
+            and "combined_score" in newcomer.metrics
+            and "combined_score" in incumbent.metrics
+        ):
+            try:
+                combined_score_log = (
+                    float(incumbent.metrics["combined_score"]),
+                    float(newcomer.metrics["combined_score"]),
+                )
+            except (TypeError, ValueError, OverflowError):
+                # Fitness comparison already used the normal safe fallback. A
+                # malformed display-only value must not make role transfer fail.
+                combined_score_log = None
+        cell = list(stored_newcomer_cell)
+        replacement_event: Dict[str, Any] = {
+            "old_id": incumbent_id,
+            "new_id": newcomer.id,
+            "island": island_idx,
+            "cell": cell,
+            "exact_fitness": newcomer_fitness,
+            "iteration": newcomer.iteration_found,
+            "archive_transferred": archive_transferred,
+            "island_best_transferred": island_best_transferred,
+            "global_best_transferred": global_best_transferred,
+            "replacement_kind": replacement_kind,
+        }
+
+        # These direct pointer transfers happen before the ordinary best-update
+        # methods run, so preserve their strict-improvement diagnostics here.
+        # Logging remains on the pre-commit side of the atomic boundary. Neutral
+        # transfer is representational drift, never a fitness improvement.
+        if global_best_transferred:
+            if replacement_kind == "neutral":
+                logger.info(
+                    "Neutral supersession of canonical best representative: %s -> %s "
+                    "(fitness unchanged at %.4f)",
+                    incumbent_id,
+                    newcomer.id,
+                    newcomer_fitness,
+                )
+            elif combined_score_log is not None:
+                old_score, new_score = combined_score_log
+                logger.info(
+                    "New best program %s replaces %s "
+                    "(combined_score: %.4f → %.4f, +%.4f)",
+                    newcomer.id,
+                    incumbent_id,
+                    old_score,
+                    new_score,
+                    new_score - old_score,
+                )
+            else:
+                logger.info(
+                    "New best program %s replaces %s", newcomer.id, incumbent_id
+                )
+
+        if island_best_transferred and replacement_kind == "strict":
+            if combined_score_log is not None:
+                old_score, new_score = combined_score_log
+                logger.debug(
+                    "Island %d: New best program %s replaces %s "
+                    "(combined_score: %.4f → %.4f, +%.4f)",
+                    island_idx,
+                    newcomer.id,
+                    incumbent_id,
+                    old_score,
+                    new_score,
+                    new_score - old_score,
+                )
+            else:
+                logger.debug(
+                    "Island %d: New best program %s replaces %s",
+                    island_idx,
+                    newcomer.id,
+                    incumbent_id,
+                )
+
+        if "diversity" in self.config.feature_dimensions:
+            self._invalidate_diversity_cache()
+
+        # Snapshot the small set of fields touched by the commit. Normal central
+        # execution uses built-in containers and cannot fail here, but rollback
+        # keeps even unexpected container/metadata errors from exposing a partial
+        # active-state transfer.
+        metadata_missing = object()
+        previous_newcomer_island = newcomer.metadata.get("island", metadata_missing)
+        previous_replacement_event = newcomer.metadata.get(
+            "map_elites_replacement", metadata_missing
+        )
+        previous_global_best = self.best_program_id
+        previous_island_best = self.island_best_programs[island_idx]
+        prompt_was_cached = (
+            self.prompts_by_program is not None
+            and incumbent_id in self.prompts_by_program
+        )
+        incumbent_prompts = (
+            self.prompts_by_program.get(incumbent_id)
+            if prompt_was_cached
+            else None
+        )
+
+        try:
+            newcomer.metadata["island"] = island_idx
+            newcomer.metadata["map_elites_replacement"] = replacement_event
+            self.islands[island_idx].add(newcomer.id)
+            island_map[feature_key] = newcomer.id
+
+            if archive_transferred:
+                self.archive.discard(incumbent_id)
+                self.archive.add(newcomer.id)
+            if island_best_transferred:
+                self.island_best_programs[island_idx] = newcomer.id
+            if global_best_transferred:
+                self.best_program_id = newcomer.id
+
+            self.islands[island_idx].discard(incumbent_id)
+            if self.prompts_by_program is not None:
+                self.prompts_by_program.pop(incumbent_id, None)
+
+            remaining_roles = []
+            if any(
+                incumbent_id in feature_map.values()
+                for feature_map in self.island_feature_maps
+            ):
+                remaining_roles.append("map")
+            if any(incumbent_id in island for island in self.islands):
+                remaining_roles.append("island")
+            if incumbent_id in self.archive:
+                remaining_roles.append("archive")
+            if self.best_program_id == incumbent_id:
+                remaining_roles.append("global_best")
+            if incumbent_id in self.island_best_programs:
+                remaining_roles.append("island_best")
+            if remaining_roles:
+                raise RuntimeError(
+                    f"Cell incumbent {incumbent_id} retained active roles after transfer: "
+                    f"{remaining_roles}"
+                )
+
+            del self.programs[incumbent_id]
+        except Exception:
+            self.programs[incumbent_id] = incumbent
+            island_map[feature_key] = incumbent_id
+            self.islands[island_idx].discard(newcomer.id)
+            self.islands[island_idx].add(incumbent_id)
+            self.archive.discard(newcomer.id)
+            if archive_transferred:
+                self.archive.add(incumbent_id)
+            else:
+                self.archive.discard(incumbent_id)
+            self.island_best_programs[island_idx] = previous_island_best
+            self.best_program_id = previous_global_best
+            if prompt_was_cached and self.prompts_by_program is not None:
+                self.prompts_by_program[incumbent_id] = incumbent_prompts
+            elif self.prompts_by_program is not None:
+                self.prompts_by_program.pop(incumbent_id, None)
+            if previous_newcomer_island is metadata_missing:
+                newcomer.metadata.pop("island", None)
+            else:
+                newcomer.metadata["island"] = previous_newcomer_island
+            if previous_replacement_event is metadata_missing:
+                newcomer.metadata.pop("map_elites_replacement", None)
+            else:
+                newcomer.metadata["map_elites_replacement"] = previous_replacement_event
+            raise
+
+        return replacement_event
+
     def _remove_program_if_orphaned(self, program_id: str) -> None:
         """
         Remove a program from the population if it is orphaned.
@@ -2058,6 +2491,19 @@ class ProgramDatabase:
                     # Create a copy for migration with simple new UUID
                     import uuid
 
+                    migrant_metadata = dict(migrant.metadata)
+                    # A copied genotype did not itself cause its source program's
+                    # MAP replacement. If this migration supersedes a target
+                    # incumbent, add() records a fresh target-local event.
+                    migrant_metadata.pop("map_elites_replacement", None)
+                    migrant_metadata.update(
+                        {
+                            "island": target_island,
+                            "migrant": True,
+                            "migration_source_island": i,
+                        }
+                    )
+
                     migrant_copy = Program(
                         id=str(uuid.uuid4()),
                         code=migrant.code,
@@ -2066,12 +2512,7 @@ class ProgramDatabase:
                         parent_id=migrant.id,
                         generation=migrant.generation,
                         metrics=migrant.metrics.copy(),
-                        metadata={
-                            **migrant.metadata,
-                            "island": target_island,
-                            "migrant": True,
-                            "migration_source_island": i,
-                        },
+                        metadata=migrant_metadata,
                     )
 
                     # Use add() method to properly handle MAP-Elites deduplication,

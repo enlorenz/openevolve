@@ -56,14 +56,17 @@ class TestGridStability(unittest.TestCase):
             }
 
         # Save checkpoint
+        active_ids = set(db1.programs)
         db1.save(self.test_dir, iteration=25)
 
         # Phase 2: Resume from checkpoint
         db2 = ProgramDatabase(config)
         db2.load(self.test_dir)
 
-        # Verify all programs were loaded
-        self.assertEqual(len(db2.programs), len(test_cases))
+        # Checkpoints restore the active canonical population. A strict MAP-cell
+        # replacement may retire an earlier test case while its observed feature
+        # values remain part of the persisted range statistics.
+        self.assertEqual(set(db2.programs), active_ids)
 
         # Verify feature ranges are preserved
         for dim, original_range in original_ranges.items():

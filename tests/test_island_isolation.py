@@ -34,9 +34,7 @@ class TestIslandIsolation(unittest.TestCase):
                 id=f"test_prog_{i}", code=f"# Test program {i}", metrics={"combined_score": 0.5}
             )
             island_id = i % 3
-            program.metadata["island"] = island_id
-            self.database.add(program)
-            self.database.islands[island_id].add(program.id)
+            self.database.add(program, target_island=island_id)
 
         with patch.object(controller, "executor") as mock_executor:
             mock_future = MagicMock()
@@ -101,9 +99,7 @@ class TestIslandIsolation(unittest.TestCase):
                 id=f"test_prog_{i}", code=f"# Test program {i}", metrics={"combined_score": 0.5}
             )
             island_id = i % 3
-            program.metadata["island"] = island_id
-            self.database.add(program)
-            self.database.islands[island_id].add(program.id)
+            self.database.add(program, target_island=island_id)
 
         # Set initial island
         self.database.current_island = 1
@@ -128,9 +124,7 @@ class TestIslandIsolation(unittest.TestCase):
                 id=f"test_prog_{i}", code=f"# Test program {i}", metrics={"combined_score": 0.5}
             )
             island_id = i % 3
-            program.metadata["island"] = island_id
-            self.database.add(program)
-            self.database.islands[island_id].add(program.id)
+            self.database.add(program, target_island=island_id)
 
         # Track submitted islands
         submitted_islands = []

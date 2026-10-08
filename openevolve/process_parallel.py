@@ -4,6 +4,7 @@ Process-based parallel controller for true parallelism
 
 import asyncio
 import logging
+import math
 import multiprocessing as mp
 import pickle
 import signal
@@ -19,6 +20,60 @@ from openevolve.database import Program, ProgramDatabase
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
+
+
+def _validated_map_elites_replacement(
+    program: Program,
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of a well-formed replacement event for ``program``.
+
+    Replacement metadata is written by the central database after a child is
+    admitted.  Treat it as untrusted at the process boundary: stale metadata
+    inherited from another program must not be reported as an event for this
+    child or change how best-program progress is logged.
+    """
+    event = program.metadata.get("map_elites_replacement")
+    if not isinstance(event, dict):
+        return None
+
+    new_id = event.get("new_id")
+    old_id = event.get("old_id")
+    island = event.get("island")
+    cell = event.get("cell")
+    exact_fitness = event.get("exact_fitness")
+    iteration = event.get("iteration")
+    archive_transferred = event.get("archive_transferred")
+    island_best_transferred = event.get("island_best_transferred")
+    replacement_kind = event.get("replacement_kind")
+    global_best_transferred = event.get("global_best_transferred")
+
+    if not isinstance(new_id, str) or not new_id or new_id != program.id:
+        return None
+    if not isinstance(old_id, str) or not old_id or old_id == new_id:
+        return None
+    if isinstance(island, bool) or not isinstance(island, int) or island < 0:
+        return None
+    if not isinstance(cell, list) or any(
+        isinstance(coordinate, bool) or not isinstance(coordinate, int)
+        for coordinate in cell
+    ):
+        return None
+    if isinstance(exact_fitness, bool) or not isinstance(exact_fitness, (int, float)):
+        return None
+    if isinstance(iteration, bool) or not isinstance(iteration, int):
+        return None
+    if not isinstance(archive_transferred, bool):
+        return None
+    if not isinstance(island_best_transferred, bool):
+        return None
+    if replacement_kind not in {"strict", "neutral"}:
+        return None
+    if not isinstance(global_best_transferred, bool):
+        return None
+    if replacement_kind == "neutral" and not math.isfinite(exact_fitness):
+        return None
+
+    return dict(event)
 
 
 @dataclass
@@ -647,6 +702,7 @@ class ProcessParallelController:
                         iteration=completed_iteration,
                         target_island=result.target_island,
                     )
+                    replacement_event = _validated_map_elites_replacement(child_program)
 
                     # Store artifacts
                     if result.artifacts:
@@ -694,6 +750,10 @@ class ProcessParallelController:
                                         "migration_source_island"
                                     ),
                                 }
+                            if replacement_event is not None:
+                                trace_metadata["map_elites_replacement"] = dict(
+                                    replacement_event
+                                )
 
                             self.evolution_tracer.log_trace(
                                 iteration=completed_iteration,
@@ -767,10 +827,22 @@ class ProcessParallelController:
 
                     # Check for new best
                     if self.database.best_program_id == child_program.id:
-                        logger.info(
-                            f"🌟 New best solution found at iteration {completed_iteration}: "
-                            f"{child_program.id}"
-                        )
+                        if (
+                            replacement_event is not None
+                            and replacement_event["replacement_kind"] == "neutral"
+                            and replacement_event["global_best_transferred"]
+                        ):
+                            logger.info(
+                                "Neutral canonical-best supersession at iteration "
+                                f"{completed_iteration}: "
+                                f"{replacement_event['old_id']} -> {child_program.id} "
+                                "(fitness unchanged)"
+                            )
+                        else:
+                            logger.info(
+                                f"🌟 New best solution found at iteration {completed_iteration}: "
+                                f"{child_program.id}"
+                            )
 
                     # Checkpoint callback
                     # Don't checkpoint at iteration 0 (that's just the initial program)

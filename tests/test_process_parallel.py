@@ -101,6 +101,56 @@ def evaluate(program_path):
         tracer.close()
         return json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
 
+    def _complete_result_with_replacement_event(self, result, event, filename):
+        """Inject database-owned replacement metadata after admission."""
+        trace_path = Path(self.test_dir) / filename
+        tracer = EvolutionTracer(
+            output_path=str(trace_path),
+            format="jsonl",
+            include_prompts=False,
+            buffer_size=1,
+        )
+        controller = ProcessParallelController(
+            self.config,
+            self.eval_file,
+            self.database,
+            evolution_tracer=tracer,
+        )
+        controller.executor = Mock()
+        future = MagicMock()
+        future.done.return_value = True
+        future.result.return_value = result
+        original_add = self.database.add
+
+        def add_with_replacement(program, *args, **kwargs):
+            added_id = original_add(program, *args, **kwargs)
+            program.metadata["map_elites_replacement"] = event
+            self.database.best_program_id = program.id
+            return added_id
+
+        async def complete():
+            with (
+                patch.object(controller, "_submit_iteration", return_value=future),
+                patch.object(
+                    self.database,
+                    "add",
+                    side_effect=add_with_replacement,
+                ),
+                self.assertLogs("openevolve.process_parallel", level="INFO") as logs,
+            ):
+                await controller.run_evolution(
+                    start_iteration=result.iteration,
+                    max_iterations=1,
+                    target_score=None,
+                )
+            return logs.output
+
+        log_output = asyncio.run(complete())
+        statistics = tracer.get_statistics()
+        tracer.close()
+        trace = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
+        return trace, log_output, statistics
+
     def tearDown(self):
         """Clean up test environment"""
         import shutil
@@ -491,6 +541,147 @@ def evaluate(program_path):
                 "source_island_id": 0,
             },
         )
+
+    def test_replacement_event_validation_requires_matching_child(self):
+        """Stale inherited replacement metadata is not treated as this child's event."""
+        program = Program(
+            id="replacement_child",
+            code="def replacement_child(): return 1",
+            metadata={
+                "map_elites_replacement": {
+                    "old_id": "old_owner",
+                    "new_id": "different_child",
+                    "island": 0,
+                    "cell": [1, 2],
+                    "exact_fitness": 0.5,
+                    "iteration": 1,
+                    "archive_transferred": False,
+                    "island_best_transferred": True,
+                    "replacement_kind": "neutral",
+                    "global_best_transferred": True,
+                }
+            },
+        )
+
+        self.assertIsNone(
+            process_parallel_module._validated_map_elites_replacement(program)
+        )
+
+        program.metadata["map_elites_replacement"]["new_id"] = program.id
+        validated = process_parallel_module._validated_map_elites_replacement(program)
+        self.assertEqual(validated, program.metadata["map_elites_replacement"])
+        self.assertIsNot(validated, program.metadata["map_elites_replacement"])
+
+        program.metadata["map_elites_replacement"]["exact_fitness"] = float("inf")
+        self.assertIsNone(
+            process_parallel_module._validated_map_elites_replacement(program)
+        )
+        program.metadata["map_elites_replacement"]["replacement_kind"] = "strict"
+        self.assertIsNotNone(
+            process_parallel_module._validated_map_elites_replacement(program)
+        )
+
+        del program.metadata["map_elites_replacement"]["cell"]
+        self.assertIsNone(
+            process_parallel_module._validated_map_elites_replacement(program)
+        )
+
+    def test_neutral_best_supersession_reaches_trace_without_improvement_log(self):
+        """A neutral best transfer is traced but is not reported as score progress."""
+        parent = self.database.get("test_0")
+        parent.metrics["combined_score"] = 0.5
+        child_id = "neutral_best_child"
+        result = SerializableResult(
+            child_program_dict={
+                "id": child_id,
+                "code": "def neutral_best_child(): return 1",
+                "language": "python",
+                "parent_id": parent.id,
+                "generation": parent.generation + 1,
+                "metrics": dict(parent.metrics),
+                "iteration_found": 1,
+                "metadata": {"changes": "neutral replacement", "island": 0},
+            },
+            parent_program_dict=parent.to_dict(),
+            parent_id=parent.id,
+            iteration=1,
+            target_island=0,
+        )
+        event = {
+            "old_id": parent.id,
+            "new_id": child_id,
+            "island": 0,
+            "cell": list(parent.metadata["map_elites_cell"]),
+            "exact_fitness": 0.5,
+            "iteration": 1,
+            "replacement_kind": "neutral",
+            "archive_transferred": True,
+            "island_best_transferred": True,
+            "global_best_transferred": True,
+        }
+
+        trace, log_output, statistics = self._complete_result_with_replacement_event(
+            result,
+            event,
+            "neutral-replacement-trace.jsonl",
+        )
+
+        self.assertEqual(trace["metadata"]["map_elites_replacement"], event)
+        joined_logs = "\n".join(log_output)
+        self.assertIn("Neutral canonical-best supersession", joined_logs)
+        self.assertIn(f"{parent.id} -> {child_id}", joined_logs)
+        self.assertNotIn("New best solution", joined_logs)
+        self.assertEqual(statistics["total_traces"], 1)
+        self.assertEqual(statistics["improvement_count"], 0)
+        self.assertEqual(statistics["total_improvement"]["combined_score"], 0.0)
+
+    def test_strict_best_replacement_keeps_new_best_log(self):
+        """Strict MAP replacement continues to report a genuine new best."""
+        parent = self.database.get("test_0")
+        parent.metrics["combined_score"] = 0.5
+        child_id = "strict_best_child"
+        child_metrics = dict(parent.metrics)
+        child_metrics["combined_score"] = 0.6
+        result = SerializableResult(
+            child_program_dict={
+                "id": child_id,
+                "code": "def strict_best_child(): return 1",
+                "language": "python",
+                "parent_id": parent.id,
+                "generation": parent.generation + 1,
+                "metrics": child_metrics,
+                "iteration_found": 1,
+                "metadata": {"changes": "strict replacement", "island": 0},
+            },
+            parent_program_dict=parent.to_dict(),
+            parent_id=parent.id,
+            iteration=1,
+            target_island=0,
+        )
+        event = {
+            "old_id": parent.id,
+            "new_id": child_id,
+            "island": 0,
+            "cell": list(parent.metadata["map_elites_cell"]),
+            "exact_fitness": 0.6,
+            "iteration": 1,
+            "replacement_kind": "strict",
+            "archive_transferred": False,
+            "island_best_transferred": True,
+            "global_best_transferred": True,
+        }
+
+        trace, log_output, statistics = self._complete_result_with_replacement_event(
+            result,
+            event,
+            "strict-replacement-trace.jsonl",
+        )
+
+        self.assertEqual(trace["metadata"]["map_elites_replacement"], event)
+        joined_logs = "\n".join(log_output)
+        self.assertIn("New best solution found", joined_logs)
+        self.assertNotIn("Neutral canonical-best supersession", joined_logs)
+        self.assertEqual(statistics["improvement_count"], 1)
 
     def test_request_shutdown(self):
         """Test graceful shutdown request"""

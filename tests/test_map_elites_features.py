@@ -61,7 +61,9 @@ class TestMapElitesFeatures(unittest.TestCase):
                 id=f"prog_{i}",
                 code=f"def func_{i}():\n    " + "x = 1\n" * i,  # Varying complexity
                 language="python",
-                metrics={"score": 0.5},
+                # Descending fitness keeps same-cell nonowners active while
+                # avoiding neutral canonical-representative supersession.
+                metrics={"score": 1.0 - i * 0.01},
             )
             self.db.add(program)
 
