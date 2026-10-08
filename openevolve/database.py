@@ -367,29 +367,25 @@ class ProgramDatabase:
                 if self.prompts_by_program is not None:
                     self.prompts_by_program.pop(incumbent_id, None)
             else:
-                new_fitness = get_fitness_score(
-                    program.metrics, self.config.feature_dimensions
-                )
-                incumbent_fitness = get_fitness_score(
-                    incumbent.metrics, self.config.feature_dimensions
-                )
-                is_exact_finite_tie = (
-                    math.isfinite(new_fitness)
-                    and math.isfinite(incumbent_fitness)
-                    and new_fitness == incumbent_fitness
+                new_neutral_fitness = self._get_neutral_fitness_score(program)
+                incumbent_neutral_fitness = self._get_neutral_fitness_score(incumbent)
+                is_valid_exact_tie = (
+                    new_neutral_fitness is not None
+                    and incumbent_neutral_fitness is not None
+                    and new_neutral_fitness == incumbent_neutral_fitness
                 )
                 if (
                     program.id != incumbent.id
                     and program.code != incumbent.code
-                    and is_exact_finite_tie
+                    and is_valid_exact_tie
                 ):
                     should_install_in_cell = True
                     replacement_kind = "neutral"
-                elif not is_exact_finite_tie and self._is_better(program, incumbent):
-                    # Exact finite ties are handled exclusively by the neutral
-                    # predicate above. In particular, _is_better's legacy
-                    # timestamp fallback for empty metrics must not turn a tie or
-                    # identical-code duplicate into a strict replacement.
+                elif not is_valid_exact_tie and self._is_better(program, incumbent):
+                    # Evidence-backed exact ties are handled exclusively by the
+                    # neutral predicate above. If either program lacks usable
+                    # fitness evidence, preserve _is_better's legacy timestamp
+                    # and metrics-presence fallbacks.
                     should_install_in_cell = True
                     replacement_kind = "strict"
 
@@ -1327,6 +1323,55 @@ class ProgramDatabase:
 
         return self._llm_judge_novelty(program, self.programs[max_smlty_pid])
 
+    def _get_neutral_fitness_score(self, program: Program) -> Optional[float]:
+        """Return a finite, evidence-backed score for neutral comparison.
+
+        ``get_fitness_score`` intentionally falls back to ``0.0`` when metrics
+        contain no usable fitness value. That behavior remains appropriate for
+        legacy ranking, but neutral supersession must distinguish that fallback
+        from a genuinely evaluated zero. MAP feature dimensions are not fitness
+        evidence, even though the global scorer retains a backward-compatible
+        all-metrics fallback.
+        """
+        metrics = program.metrics
+        if not isinstance(metrics, dict) or not metrics:
+            return None
+
+        if "combined_score" in metrics:
+            combined_score = metrics["combined_score"]
+            # Booleans are flags, not evaluated scores. get_fitness_score keeps
+            # its existing coercion behavior; neutral matching is narrower.
+            if isinstance(combined_score, bool):
+                return None
+            try:
+                parsed_score = float(combined_score)
+            except (TypeError, ValueError, OverflowError):
+                # An invalid combined_score follows get_fitness_score's normal
+                # non-feature numeric fallback below.
+                pass
+            else:
+                return parsed_score if math.isfinite(parsed_score) else None
+
+        has_fallback_evidence = False
+        for name, value in metrics.items():
+            if name == "combined_score" or name in self.config.feature_dimensions:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(numeric_value):
+                has_fallback_evidence = True
+                break
+
+        if not has_fallback_evidence:
+            return None
+
+        score = get_fitness_score(metrics, self.config.feature_dimensions)
+        return score if math.isfinite(score) else None
+
     def _is_better(self, program1: Program, program2: Program) -> bool:
         """
         Determine if program1 has better FITNESS than program2
@@ -2052,31 +2097,29 @@ class ProgramDatabase:
                 f"Cell newcomer {newcomer.id} does not map to {feature_key!r}"
             )
 
-        incumbent_fitness = get_fitness_score(
-            incumbent.metrics, self.config.feature_dimensions
-        )
         newcomer_fitness = get_fitness_score(
             newcomer.metrics, self.config.feature_dimensions
         )
+        incumbent_neutral_fitness = self._get_neutral_fitness_score(incumbent)
+        newcomer_neutral_fitness = self._get_neutral_fitness_score(newcomer)
+        is_valid_exact_tie = (
+            incumbent_neutral_fitness is not None
+            and newcomer_neutral_fitness is not None
+            and incumbent_neutral_fitness == newcomer_neutral_fitness
+        )
         if replacement_kind == "strict":
-            if (
-                math.isfinite(newcomer_fitness)
-                and math.isfinite(incumbent_fitness)
-                and newcomer_fitness == incumbent_fitness
-            ) or not self._is_better(newcomer, incumbent):
+            if is_valid_exact_tie or not self._is_better(newcomer, incumbent):
                 raise ValueError(
                     f"Strict cell replacement {incumbent_id} -> {newcomer.id} "
                     "does not improve fitness"
                 )
         elif not (
             newcomer.code != incumbent.code
-            and math.isfinite(newcomer_fitness)
-            and math.isfinite(incumbent_fitness)
-            and newcomer_fitness == incumbent_fitness
+            and is_valid_exact_tie
         ):
             raise ValueError(
                 f"Neutral cell replacement {incumbent_id} -> {newcomer.id} "
-                "requires different code and exactly equal finite fitness"
+                "requires different code and exactly equal evidence-backed finite fitness"
             )
 
         foreign_island_best_roles = [

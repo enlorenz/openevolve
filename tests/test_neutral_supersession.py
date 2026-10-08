@@ -1,8 +1,9 @@
 """Focused regression tests for exact-fitness MAP-cell supersession.
 
 Neutral supersession is deliberately narrower than a general preference for
-newer programs: it applies only to finite, exactly equal-fitness programs with
-different IDs and different source code that collide in one island's MAP cell.
+newer programs: it applies only to evidence-backed, finite, exactly
+equal-fitness programs with different IDs and different source code that
+collide in one island's MAP cell.
 """
 
 from __future__ import annotations
@@ -42,6 +43,35 @@ def _database(
     # tests can verify retirement cleanup without constructing an LLM prompt.
     database.prompts_by_program = {}
     return database
+
+
+def _fitness_evidence_database() -> ProgramDatabase:
+    """Build a one-cell database that accepts arbitrary fitness mappings."""
+
+    config = Config()
+    config.database.in_memory = True
+    config.database.num_islands = 1
+    config.database.feature_dimensions = ["complexity"]
+    config.database.feature_bins = 2
+    config.database.feature_bin_edges = {"complexity": [100.0]}
+    database = ProgramDatabase(config.database)
+    database.prompts_by_program = {}
+    return database
+
+
+def _program_with_metrics(
+    program_id: str,
+    metrics: dict,
+    *,
+    timestamp: float = 0.0,
+    code: str | None = None,
+) -> Program:
+    return Program(
+        id=program_id,
+        code=code if code is not None else f"# {program_id}",
+        metrics=dict(metrics),
+        timestamp=timestamp,
+    )
 
 
 def _program(
@@ -214,35 +244,121 @@ class NeutralSupersessionTests(unittest.TestCase):
         self.assertIn(duplicate.id, database.programs)
         self.assertNotIn("map_elites_replacement", duplicate.metadata)
 
-    def test_empty_metric_ties_use_neutral_rules_not_timestamp_fallback(self) -> None:
-        config = Config()
-        config.database.in_memory = True
-        config.database.num_islands = 1
-        config.database.feature_dimensions = ["complexity"]
-        config.database.feature_bins = 2
-        database = ProgramDatabase(config.database)
-
-        incumbent = Program(
-            id="empty-old", code="x = 1", metrics={}, timestamp=1.0
+    def test_valid_numeric_evidence_allows_exact_neutral_supersession(self) -> None:
+        cases = (
+            ("combined-zero", {"combined_score": 0.0}, 0.0),
+            ("numeric-fallback", {"quality": 0.5567}, 0.5567),
+            (
+                "invalid-combined-with-fallback",
+                {"combined_score": "invalid", "quality": 0.5567},
+                0.5567,
+            ),
         )
-        newcomer = Program(
-            id="empty-new", code="y = 2", metrics={}, timestamp=2.0
-        )
-        database.add(incumbent, target_island=0)
-        database.add(newcomer, target_island=0)
+        for label, metrics, expected_fitness in cases:
+            with self.subTest(label=label):
+                database = _fitness_evidence_database()
+                incumbent = _program_with_metrics(f"{label}-old", metrics)
+                newcomer = _program_with_metrics(f"{label}-new", metrics)
 
-        self.assertEqual(_cell_owner(database, 0, newcomer), newcomer.id)
+                database.add(incumbent, target_island=0)
+                database.add(newcomer, target_island=0)
+
+                self.assertEqual(_cell_owner(database, 0, newcomer), newcomer.id)
+                event = newcomer.metadata["map_elites_replacement"]
+                self.assertEqual(event["replacement_kind"], "neutral")
+                self.assertEqual(event["exact_fitness"], expected_fitness)
+
+    def test_empty_metrics_preserve_legacy_timestamp_fallback(self) -> None:
+        shared_code = "value = 1"
+
+        newer_database = _fitness_evidence_database()
+        older_incumbent = _program_with_metrics(
+            "empty-old", {}, timestamp=1.0, code=shared_code
+        )
+        newer_candidate = _program_with_metrics(
+            "empty-new", {}, timestamp=2.0, code=shared_code
+        )
+        newer_database.add(older_incumbent, target_island=0)
+        newer_database.add(newer_candidate, target_island=0)
+
         self.assertEqual(
-            newcomer.metadata["map_elites_replacement"]["replacement_kind"],
-            "neutral",
+            _cell_owner(newer_database, 0, newer_candidate), newer_candidate.id
+        )
+        self.assertEqual(
+            newer_candidate.metadata["map_elites_replacement"]["replacement_kind"],
+            "strict",
         )
 
-        identical_code = Program(
-            id="empty-duplicate", code=newcomer.code, metrics={}, timestamp=3.0
+        older_database = _fitness_evidence_database()
+        newer_incumbent = _program_with_metrics(
+            "newer-incumbent", {}, timestamp=2.0, code=shared_code
         )
-        database.add(identical_code, target_island=0)
-        self.assertEqual(_cell_owner(database, 0, newcomer), newcomer.id)
-        self.assertNotIn("map_elites_replacement", identical_code.metadata)
+        older_candidate = _program_with_metrics(
+            "older-candidate", {}, timestamp=1.0, code=shared_code
+        )
+        older_database.add(newer_incumbent, target_island=0)
+        older_database.add(older_candidate, target_island=0)
+
+        self.assertEqual(
+            _cell_owner(older_database, 0, newer_incumbent), newer_incumbent.id
+        )
+        self.assertNotIn("map_elites_replacement", older_candidate.metadata)
+
+    def test_missing_and_valid_zero_preserve_metrics_presence_fallback(self) -> None:
+        valid_zero = {"combined_score": 0.0}
+
+        valid_newcomer_database = _fitness_evidence_database()
+        empty_incumbent = _program_with_metrics("empty-old", {}, timestamp=2.0)
+        valid_newcomer = _program_with_metrics(
+            "valid-new", valid_zero, timestamp=1.0
+        )
+        valid_newcomer_database.add(empty_incumbent, target_island=0)
+        valid_newcomer_database.add(valid_newcomer, target_island=0)
+
+        self.assertEqual(
+            _cell_owner(valid_newcomer_database, 0, valid_newcomer),
+            valid_newcomer.id,
+        )
+        self.assertEqual(
+            valid_newcomer.metadata["map_elites_replacement"]["replacement_kind"],
+            "strict",
+        )
+
+        empty_newcomer_database = _fitness_evidence_database()
+        valid_incumbent = _program_with_metrics(
+            "valid-old", valid_zero, timestamp=1.0
+        )
+        empty_newcomer = _program_with_metrics("empty-new", {}, timestamp=2.0)
+        empty_newcomer_database.add(valid_incumbent, target_island=0)
+        empty_newcomer_database.add(empty_newcomer, target_island=0)
+
+        self.assertEqual(
+            _cell_owner(empty_newcomer_database, 0, valid_incumbent),
+            valid_incumbent.id,
+        )
+        self.assertNotIn("map_elites_replacement", empty_newcomer.metadata)
+
+    def test_unusable_fitness_evidence_does_not_neutral_supersede(self) -> None:
+        cases = (
+            ("malformed-fallback", {"quality": "not-a-number"}),
+            ("boolean-only", {"timeout": True}),
+            ("boolean-combined", {"combined_score": True}),
+            ("invalid-combined", {"combined_score": "not-a-number"}),
+            ("feature-only", {"complexity": 7.0}),
+        )
+        for label, metrics in cases:
+            with self.subTest(label=label):
+                database = _fitness_evidence_database()
+                incumbent = _program_with_metrics(f"{label}-old", metrics)
+                newcomer = _program_with_metrics(f"{label}-new", metrics)
+
+                database.add(incumbent, target_island=0)
+                database.add(newcomer, target_island=0)
+
+                self.assertEqual(_cell_owner(database, 0, incumbent), incumbent.id)
+                self.assertIn(incumbent.id, database.programs)
+                self.assertIn(newcomer.id, database.programs)
+                self.assertNotIn("map_elites_replacement", newcomer.metadata)
 
     def test_nonfinite_equal_scores_do_not_neutral_supersede(self) -> None:
         for index, score in enumerate((math.nan, math.inf, -math.inf)):
