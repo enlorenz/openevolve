@@ -2014,6 +2014,409 @@ class ProgramDatabase:
 
         return inspirations[:n]
 
+    def sample_true_diverse_inspirations(
+        self,
+        parent: Program,
+        target_island: int,
+        n: int,
+        excluded_program_ids: Optional[Set[str]] = None,
+        lineage_depth: int = 3,
+    ) -> Tuple[List[Program], Dict[str, Any]]:
+        """Select honest, auditable inspirations from distinct MAP cells.
+
+        This is the opt-in selector used by the true-diversity prompt path.  It
+        intentionally does not replace :meth:`_sample_inspirations`, whose
+        behavior is part of the legacy prompt contract.  Candidates come only
+        from the authoritative MAP owner table for ``target_island``; cached
+        ``map_elites_cell`` metadata is never used to establish ownership.
+
+        In addition to distinct cells, the selector avoids duplicate source and
+        obvious close relatives of the parent, top prompt examples, and already
+        selected inspirations.  The lineage check is deliberately best-effort:
+        it follows only live ``parent_id`` links to a small bounded depth and
+        never interprets MAP replacement provenance as ancestry.
+
+        Args:
+            parent: Current mutation parent. It may belong to another island
+                when archive selection falls back globally.
+            target_island: Scheduled island whose authoritative MAP supplies
+                inspiration candidates.
+            n: Maximum number of inspirations to return.
+            excluded_program_ids: IDs already selected for the top-program
+                prompt block. These IDs, their exact-code duplicates, and their
+                close live relatives are excluded.
+            lineage_depth: Maximum live-parent depth used by the B-lite recent
+                ancestry comparison.
+
+        Returns:
+            ``(programs, audit)`` where ``programs`` contains at most ``n``
+            honest inspirations and ``audit`` is JSON-serializable selection
+            provenance suitable for evolution tracing.
+        """
+        requested_count = max(0, int(n))
+        lineage_depth = max(0, int(lineage_depth))
+        target_island %= len(self.islands)
+
+        top_ids = set(excluded_program_ids or set())
+        top_ids.discard(parent.id)
+        parent_island = self._true_diversity_json_scalar(
+            parent.metadata.get("island")
+        )
+        audit: Dict[str, Any] = {
+            "true_diversity": True,
+            "requested_count": requested_count,
+            "returned_count": 0,
+            "target_island": target_island,
+            "parent_id": parent.id,
+            "parent_island": parent_island,
+            "foreign_parent": parent_island is not None and parent_island != target_island,
+            "selected_program_ids": [],
+            "selected_map_cells": {},
+            "selected_descriptor_values": {},
+            "selected_source_islands": {},
+            "excluded_parent_ids": [parent.id],
+            "excluded_top_ids": sorted(top_ids),
+            "identical_code_exclusions": [],
+            "close_relative_exclusions": [],
+            "ineligible_exclusions": [],
+            "exclusion_details": [],
+            "lineage_depth": lineage_depth,
+            "occupied_cell_count": len(self.island_feature_maps[target_island]),
+            "eligible_owner_count": 0,
+            "shortfall_count": requested_count,
+            "shortfall_reason": None,
+        }
+
+        if requested_count == 0:
+            return [], audit
+
+        # Copy the two active indexes before filtering so the selector observes
+        # one compact view even when process-parallel scheduling is enabled.
+        authoritative_map = dict(self.island_feature_maps[target_island])
+        active_island_ids = set(self.islands[target_island])
+        if not authoritative_map:
+            audit["shortfall_reason"] = "no_occupied_cells"
+            return [], audit
+
+        hard_excluded_ids = {parent.id}.union(top_ids)
+        baseline_programs = [parent]
+        baseline_programs.extend(
+            self.programs[program_id]
+            for program_id in sorted(top_ids)
+            if program_id in self.programs
+        )
+
+        # Each entry is (authoritative cell key, live owner). A well-formed MAP
+        # has one cell per owner; the seen-ID guard keeps malformed duplicate
+        # owner entries from becoming duplicate examples.
+        eligible: List[Tuple[str, Program]] = []
+        seen_owner_ids: Set[str] = set()
+        for cell_key, owner_id in authoritative_map.items():
+            if owner_id in hard_excluded_ids:
+                audit["exclusion_details"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "parent" if owner_id == parent.id else "top_program",
+                    }
+                )
+                continue
+
+            owner = self.programs.get(owner_id)
+            if owner is None:
+                audit["ineligible_exclusions"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "owner_not_live",
+                    }
+                )
+                continue
+            if owner_id not in active_island_ids:
+                audit["ineligible_exclusions"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "owner_not_active_in_target_island",
+                    }
+                )
+                continue
+            if owner_id in seen_owner_ids:
+                audit["ineligible_exclusions"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "duplicate_authoritative_owner_id",
+                    }
+                )
+                continue
+            seen_owner_ids.add(owner_id)
+            if not isinstance(owner.code, str) or not owner.code.strip():
+                audit["ineligible_exclusions"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "unusable_source_code",
+                    }
+                )
+                continue
+
+            fitness = self._true_diversity_fitness_score(owner)
+            if fitness is None:
+                audit["ineligible_exclusions"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "non_finite_or_missing_fitness",
+                    }
+                )
+                continue
+
+            duplicate_of = next(
+                (
+                    other.id
+                    for other in baseline_programs
+                    if isinstance(other.code, str) and owner.code == other.code
+                ),
+                None,
+            )
+            if duplicate_of is not None:
+                audit["identical_code_exclusions"].append(owner_id)
+                audit["exclusion_details"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "identical_code",
+                        "related_program_id": duplicate_of,
+                    }
+                )
+                continue
+
+            relationship = self._true_diversity_relationship(
+                owner, baseline_programs, lineage_depth
+            )
+            if relationship is not None:
+                reason, related_program_id = relationship
+                audit["close_relative_exclusions"].append(owner_id)
+                audit["exclusion_details"].append(
+                    {
+                        "program_id": owner_id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": reason,
+                        "related_program_id": related_program_id,
+                    }
+                )
+                continue
+
+            eligible.append((cell_key, owner))
+
+        audit["eligible_owner_count"] = len(eligible)
+        random.shuffle(eligible)
+
+        selected: List[Program] = []
+        selected_cells: Dict[str, List[int]] = {}
+        selected_descriptors: Dict[str, Dict[str, Any]] = {}
+        selected_source_islands: Dict[str, int] = {}
+        selected_programs: List[Program] = []
+        selected_codes: Set[str] = set()
+
+        for cell_key, candidate in eligible:
+            if len(selected) >= requested_count:
+                break
+
+            if candidate.code in selected_codes:
+                audit["identical_code_exclusions"].append(candidate.id)
+                audit["exclusion_details"].append(
+                    {
+                        "program_id": candidate.id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": "identical_code",
+                        "related_program_id": next(
+                            selected_program.id
+                            for selected_program in selected_programs
+                            if selected_program.code == candidate.code
+                        ),
+                    }
+                )
+                continue
+
+            relationship = self._true_diversity_relationship(
+                candidate, selected_programs, lineage_depth
+            )
+            if relationship is not None:
+                reason, related_program_id = relationship
+                audit["close_relative_exclusions"].append(candidate.id)
+                audit["exclusion_details"].append(
+                    {
+                        "program_id": candidate.id,
+                        "cell": self._true_diversity_cell_coordinates(cell_key),
+                        "reason": reason,
+                        "related_program_id": related_program_id,
+                    }
+                )
+                continue
+
+            selected.append(candidate)
+            selected_programs.append(candidate)
+            selected_codes.add(candidate.code)
+            selected_cells[candidate.id] = self._true_diversity_cell_coordinates(cell_key)
+            selected_descriptors[candidate.id] = {
+                dimension: self._true_diversity_json_scalar(
+                    candidate.metrics[dimension]
+                )
+                for dimension in self.config.feature_dimensions
+                if dimension in candidate.metrics
+            }
+            selected_source_islands[candidate.id] = target_island
+
+        audit["returned_count"] = len(selected)
+        audit["selected_program_ids"] = [program.id for program in selected]
+        audit["selected_map_cells"] = selected_cells
+        audit["selected_descriptor_values"] = selected_descriptors
+        audit["selected_source_islands"] = selected_source_islands
+        audit["shortfall_count"] = requested_count - len(selected)
+        if audit["shortfall_count"]:
+            if not eligible:
+                audit["shortfall_reason"] = "no_eligible_authoritative_map_owners"
+            else:
+                audit["shortfall_reason"] = (
+                    "insufficient_distinct_eligible_cells_after_exclusions"
+                )
+
+        logger.debug(
+            "True-diversity sampling returned %d/%d inspirations from island %d",
+            len(selected),
+            requested_count,
+            target_island,
+        )
+        return selected, audit
+
+    @staticmethod
+    def _true_diversity_cell_coordinates(cell_key: str) -> List[int]:
+        """Decode a canonical MAP cell key for audit/prompt provenance."""
+        return [int(coordinate) for coordinate in cell_key.split("-")]
+
+    @staticmethod
+    def _true_diversity_json_scalar(value: Any) -> Any:
+        """Return a JSON-safe scalar without changing ordinary Python values."""
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _true_diversity_fitness_score(self, program: Program) -> Optional[float]:
+        """Return finite generic fitness backed by at least one numeric metric.
+
+        Unlike neutral-supersession comparison, true-diversity eligibility keeps
+        ``get_fitness_score``'s generic fallback to feature metrics. That is
+        important for OpenEvolve tasks which expose no separate scalar objective.
+        Empty, flag-only, NaN-only, and infinite resulting fitness remain
+        ineligible.
+        """
+        metrics = program.metrics
+        if not isinstance(metrics, dict) or not metrics:
+            return None
+        has_finite_numeric_evidence = False
+        for value in metrics.values():
+            if not isinstance(value, (int, float, np.number)) or isinstance(value, bool):
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(numeric_value):
+                has_finite_numeric_evidence = True
+                break
+        if not has_finite_numeric_evidence:
+            return None
+
+        score = get_fitness_score(metrics, self.config.feature_dimensions)
+        try:
+            numeric_score = float(score)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return numeric_score if math.isfinite(numeric_score) else None
+
+    def _true_diversity_recent_live_ancestors(
+        self, program: Program, lineage_depth: int
+    ) -> Set[str]:
+        """Return at most ``lineage_depth`` ancestors reachable through live IDs."""
+        ancestors: Set[str] = set()
+        next_parent_id = program.parent_id
+        for _ in range(lineage_depth):
+            if not next_parent_id or next_parent_id in ancestors:
+                break
+            ancestor = self.programs.get(next_parent_id)
+            if ancestor is None:
+                break
+            # A parentless live node is the run's ultimate founder, not a
+            # useful family discriminator. Direct children/siblings are
+            # handled separately; do not make every early branch related just
+            # because the shared initial program still happens to be active.
+            if ancestor.parent_id is None:
+                break
+            ancestors.add(ancestor.id)
+            next_parent_id = ancestor.parent_id
+        return ancestors
+
+    def _true_diversity_pair_relationship(
+        self, first: Program, second: Program, lineage_depth: int
+    ) -> Optional[str]:
+        """Describe an obvious B-lite relation, or return ``None``.
+
+        Only ``parent_id`` and explicit migration metadata participate. MAP
+        replacement metadata is intentionally ignored because supersession is a
+        representation change rather than a lineage edge.
+        """
+        if first.id == second.id:
+            return "identical_program_id"
+
+        if (
+            first.metadata.get("migrant") is True
+            and first.parent_id == second.id
+        ) or (
+            second.metadata.get("migrant") is True
+            and second.parent_id == first.id
+        ):
+            return "migration_clone"
+
+        if first.parent_id == second.id or second.parent_id == first.id:
+            return "direct_parent_child"
+        if first.parent_id and first.parent_id == second.parent_id:
+            return "siblings"
+        if lineage_depth <= 0:
+            return None
+
+        first_ancestors = self._true_diversity_recent_live_ancestors(
+            first, lineage_depth
+        )
+        second_ancestors = self._true_diversity_recent_live_ancestors(
+            second, lineage_depth
+        )
+        if second.id in first_ancestors or first.id in second_ancestors:
+            return "recent_ancestor_descendant"
+        if first_ancestors.intersection(second_ancestors):
+            return "recent_common_ancestor"
+        return None
+
+    def _true_diversity_relationship(
+        self,
+        candidate: Program,
+        comparison_programs: List[Program],
+        lineage_depth: int,
+    ) -> Optional[Tuple[str, str]]:
+        """Return the first B-lite relation and the related program ID."""
+        for comparison in comparison_programs:
+            relationship = self._true_diversity_pair_relationship(
+                candidate, comparison, lineage_depth
+            )
+            if relationship is not None:
+                return relationship, comparison.id
+        return None
+
     def _replace_cell_incumbent(
         self,
         incumbent_id: str,

@@ -386,7 +386,8 @@ class PromptSampler:
         diverse_programs_str = ""
         diverse_programs: List[Dict[str, Any]] = []
         if (
-            self.config.num_diverse_programs > 0
+            not self.config.true_diversity
+            and self.config.num_diverse_programs > 0
             and len(top_programs) > self.config.num_top_programs
         ):
             # Skip the top programs we already included
@@ -487,7 +488,14 @@ class PromptSampler:
 
         # Get templates
         inspirations_section_template = self.template_manager.get_template("inspirations_section")
-        inspiration_program_template = self.template_manager.get_template("inspiration_program")
+        if self.config.true_diversity:
+            inspiration_program_template = self.template_manager.get_template(
+                "true_diversity_inspiration_program"
+            )
+        else:
+            inspiration_program_template = self.template_manager.get_template(
+                "inspiration_program"
+            )
 
         inspiration_programs_str = ""
 
@@ -508,20 +516,68 @@ class PromptSampler:
             # Extract unique features (emphasizing diversity rather than just performance)
             unique_features = self._extract_unique_features(program)
 
-            inspiration_programs_str += (
-                inspiration_program_template.format(
-                    program_number=i + 1,
-                    score=f"{score:.4f}",
-                    program_type=program_type,
-                    language=("text" if self.config.programs_as_changes_description else language),
-                    program_snippet=program_code,
-                    unique_features=unique_features,
+            template_values = {
+                "program_number": i + 1,
+                "score": f"{score:.4f}",
+                "program_type": program_type,
+                "language": (
+                    "text" if self.config.programs_as_changes_description else language
+                ),
+                "program_snippet": program_code,
+                "unique_features": unique_features,
+            }
+            if self.config.true_diversity:
+                template_values["map_niche"] = self._format_true_diversity_niche(
+                    program, feature_dimensions
                 )
-                + "\n\n"
+
+            inspiration_programs_str += (
+                inspiration_program_template.format(**template_values) + "\n\n"
             )
 
         return inspirations_section_template.format(
             inspiration_programs=inspiration_programs_str.strip()
+        )
+
+    def _format_true_diversity_niche(
+        self,
+        program: Dict[str, Any],
+        feature_dimensions: Optional[List[str]] = None,
+    ) -> str:
+        """Format concise authoritative MAP provenance supplied by the selector."""
+        niche = program.get("true_diversity_niche", {})
+        metadata = program.get("metadata", {})
+
+        map_cell = niche.get("map_cell")
+        if isinstance(map_cell, (list, tuple)):
+            cell_text = "[" + ", ".join(str(coordinate) for coordinate in map_cell) + "]"
+        else:
+            cell_text = "unavailable"
+
+        descriptor_values = niche.get("descriptor_values") or {}
+        if not descriptor_values:
+            metrics = program.get("metrics", {})
+            descriptor_values = {
+                dimension: metrics[dimension]
+                for dimension in feature_dimensions or []
+                if dimension in metrics
+            }
+
+        descriptor_parts = []
+        for dimension in feature_dimensions or descriptor_values.keys():
+            if dimension not in descriptor_values:
+                continue
+            value = descriptor_values[dimension]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                descriptor_parts.append(f"{dimension}={value:.4g}")
+            else:
+                descriptor_parts.append(f"{dimension}={value}")
+        descriptor_text = ", ".join(descriptor_parts) or "unavailable"
+
+        source_island = niche.get("source_island", metadata.get("island", "unavailable"))
+        return (
+            f"cell={cell_text}; descriptors: {descriptor_text}; "
+            f"source island={source_island}"
         )
 
     def _determine_program_type(

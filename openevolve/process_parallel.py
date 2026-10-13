@@ -91,6 +91,7 @@ class SerializableResult:
     target_island: Optional[int] = None  # Island where child should be placed
     parent_program_dict: Optional[Dict[str, Any]] = None  # Parent fields needed for tracing
     parent_selection_source: Optional[str] = None
+    true_diversity_provenance: Optional[Dict[str, Any]] = None
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -194,6 +195,8 @@ def _run_iteration_worker(
     parent_id: str,
     inspiration_ids: List[str],
     parent_selection_source: Optional[str] = None,
+    top_program_ids: Optional[List[str]] = None,
+    true_diversity_provenance: Optional[Dict[str, Any]] = None,
 ) -> SerializableResult:
     """Run a single iteration in a worker process"""
     try:
@@ -221,13 +224,43 @@ def _run_iteration_worker(
             reverse=True,
         )
 
-        # Use config values for limits instead of hardcoding
-        # Programs for LLM display (includes both top and diverse for inspiration)
-        programs_for_prompt = island_programs[
-            : _worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs
-        ]
-        # Best programs only (for previous attempts section, focused on top performers)
-        best_programs_only = island_programs[: _worker_config.prompt.num_top_programs]
+        # The legacy branch intentionally passes T+D ranked programs so the
+        # prompt sampler can create its historical pseudo-diverse block.  The
+        # opt-in branch receives the centrally fixed top IDs and passes only T;
+        # its inspirations are the single centrally selected diverse pool.
+        if _worker_config.prompt.true_diversity:
+            if top_program_ids is None:
+                programs_for_prompt = island_programs[: _worker_config.prompt.num_top_programs]
+            else:
+                programs_for_prompt = [
+                    programs[program_id]
+                    for program_id in top_program_ids[: _worker_config.prompt.num_top_programs]
+                    if program_id in programs
+                ]
+            best_programs_only = programs_for_prompt
+        else:
+            programs_for_prompt = island_programs[
+                : _worker_config.prompt.num_top_programs
+                + _worker_config.prompt.num_diverse_programs
+            ]
+            best_programs_only = island_programs[: _worker_config.prompt.num_top_programs]
+
+        inspiration_dicts = [program.to_dict() for program in inspirations]
+        if _worker_config.prompt.true_diversity and true_diversity_provenance:
+            selected_cells = true_diversity_provenance.get("selected_map_cells", {})
+            selected_descriptors = true_diversity_provenance.get(
+                "selected_descriptor_values", {}
+            )
+            selected_islands = true_diversity_provenance.get("selected_source_islands", {})
+            for inspiration_dict in inspiration_dicts:
+                program_id = inspiration_dict.get("id")
+                inspiration_dict["true_diversity_niche"] = {
+                    "map_cell": selected_cells.get(program_id),
+                    "descriptor_values": selected_descriptors.get(program_id, {}),
+                    "source_island": selected_islands.get(
+                        program_id, true_diversity_provenance.get("target_island")
+                    ),
+                }
 
         # Build prompt
         if _worker_config.prompt.programs_as_changes_description:
@@ -245,7 +278,7 @@ def _run_iteration_worker(
             program_metrics=parent.metrics,
             previous_programs=[p.to_dict() for p in best_programs_only],
             top_programs=[p.to_dict() for p in programs_for_prompt],
-            inspirations=[p.to_dict() for p in inspirations],
+            inspirations=inspiration_dicts,
             language=_worker_config.language,
             evolution_round=iteration,
             diff_based_evolution=_worker_config.diff_based_evolution,
@@ -404,6 +437,7 @@ def _run_iteration_worker(
             iteration=iteration,
             target_island=target_island,
             parent_selection_source=parent_selection_source,
+            true_diversity_provenance=true_diversity_provenance,
         )
 
     except Exception as e:
@@ -740,6 +774,11 @@ class ProcessParallelController:
                                 trace_metadata["parent_selection_source"] = (
                                     result.parent_selection_source
                                 )
+                            if result.true_diversity_provenance is not None:
+                                trace_metadata["true_diversity"] = True
+                                trace_metadata["true_diversity_selection"] = dict(
+                                    result.true_diversity_provenance
+                                )
                             if (
                                 parent_program.metadata.get("migrant", False)
                                 and parent_program.parent_id
@@ -981,32 +1020,87 @@ class ProcessParallelController:
             # Use specified island or current island
             target_island = island_id if island_id is not None else self.database.current_island
 
-            # Use thread-safe sampling that doesn't modify shared state
-            # This fixes the race condition from GitHub issue #246
-            # Inspirations are the diverse/creative examples; size them by
-            # num_diverse_programs (not num_top_programs) so the config parameter
-            # actually controls the inspiration count (GitHub issue #452).
-            parent, inspirations, parent_selection_source = (
-                self.database.sample_from_island(
+            if self.config.prompt.true_diversity:
+                # Preserve the existing parent probabilities and fallbacks while
+                # bypassing the legacy inspiration result.  A zero-sized request
+                # makes sample_from_island return no examples without changing
+                # how it selects the parent.
+                parent, _, parent_selection_source = self.database.sample_from_island(
                     island_id=target_island,
-                    num_inspirations=self.config.prompt.num_diverse_programs,
+                    num_inspirations=0,
                     include_selection_source=True,
                 )
-            )
+
+                # Match the worker's legacy top ordering exactly and freeze the
+                # IDs before selecting diverse examples so overlap is excluded
+                # centrally rather than repaired in prompt formatting.
+                parent_island = parent.metadata.get("island", self.database.current_island)
+                island_programs = [
+                    self.database.programs[program_id]
+                    for program_id in self.database.islands[parent_island]
+                    if program_id in self.database.programs
+                ]
+                island_programs.sort(
+                    key=lambda program: program.metrics.get(
+                        "combined_score", safe_numeric_average(program.metrics)
+                    ),
+                    reverse=True,
+                )
+                top_program_ids = [
+                    program.id
+                    for program in island_programs[: self.config.prompt.num_top_programs]
+                ]
+
+                inspirations, true_diversity_provenance = (
+                    self.database.sample_true_diverse_inspirations(
+                        parent=parent,
+                        target_island=target_island,
+                        n=self.config.prompt.num_diverse_programs,
+                        excluded_program_ids=top_program_ids,
+                        lineage_depth=3,
+                    )
+                )
+                logger.info(
+                    "True-diversity inspiration selection for iteration %s: %s",
+                    iteration,
+                    true_diversity_provenance,
+                )
+            else:
+                # Legacy behavior is intentionally kept byte-for-byte in this
+                # branch, including its independent inspiration sampler.
+                parent, inspirations, parent_selection_source = (
+                    self.database.sample_from_island(
+                        island_id=target_island,
+                        num_inspirations=self.config.prompt.num_diverse_programs,
+                        include_selection_source=True,
+                    )
+                )
 
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
 
-            # Submit to process pool
-            future = self.executor.submit(
-                _run_iteration_worker,
-                iteration,
-                db_snapshot,
-                parent.id,
-                [insp.id for insp in inspirations],
-                parent_selection_source,
-            )
+            # Keep the legacy call shape unchanged as part of the feature gate.
+            if self.config.prompt.true_diversity:
+                future = self.executor.submit(
+                    _run_iteration_worker,
+                    iteration,
+                    db_snapshot,
+                    parent.id,
+                    [insp.id for insp in inspirations],
+                    parent_selection_source,
+                    top_program_ids,
+                    true_diversity_provenance,
+                )
+            else:
+                future = self.executor.submit(
+                    _run_iteration_worker,
+                    iteration,
+                    db_snapshot,
+                    parent.id,
+                    [insp.id for insp in inspirations],
+                    parent_selection_source,
+                )
 
             return future
 

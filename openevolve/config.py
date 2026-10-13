@@ -273,6 +273,10 @@ class PromptConfig:
     num_top_programs: int = 3
     num_diverse_programs: int = 2
 
+    # Opt in to authoritative MAP-cell inspiration sampling.  False preserves
+    # the legacy, independently sampled "Diverse Programs" and inspirations.
+    true_diversity: bool = False
+
     # Template stochasticity
     use_template_stochasticity: bool = True
     template_variations: Dict[str, List[str]] = field(default_factory=dict)

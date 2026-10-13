@@ -1,0 +1,6 @@
+### Diverse Inspiration {program_number} (Score: {score})
+MAP niche: {map_niche}
+```{language}
+{program_snippet}
+```
+Distinctive approach: {unique_features}
