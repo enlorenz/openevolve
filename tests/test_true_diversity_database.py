@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from openevolve.config import DatabaseConfig
 from openevolve.database import Program, ProgramDatabase
@@ -113,6 +114,7 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
             audit["identical_code_exclusions"],
             [parent_clone.id, top_clone.id],
         )
+        self.assertEqual(audit["individually_eligible_candidate_count"], 3)
         self.assertTrue(audit["foreign_parent"])
         self.assertEqual(set(audit["selected_source_islands"].values()), {0})
         self.assertEqual(
@@ -193,7 +195,7 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
         self.assertEqual(reasons[top_child.id], "direct_parent_child")
         self.assertEqual(audit["lineage_depth"], 3)
 
-    def test_pairwise_code_and_kin_filters_never_relax_to_fill(self) -> None:
+    def test_wildcard_relaxes_kinship_but_not_identical_code(self) -> None:
         database = _database()
         parent = _program("parent", island=1)
         duplicate_a = _program("duplicate-a", code="def duplicate(): pass")
@@ -212,17 +214,310 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
         )
 
         selected_ids = {program.id for program in selected}
-        self.assertEqual(len(selected), 3)
+        self.assertEqual(len(selected), 4)
         self.assertEqual(len(selected_ids.intersection({duplicate_a.id, duplicate_b.id})), 1)
-        self.assertEqual(len(selected_ids.intersection({sibling_a.id, sibling_b.id})), 1)
+        self.assertEqual(len(selected_ids.intersection({sibling_a.id, sibling_b.id})), 2)
         self.assertIn(unrelated.id, selected_ids)
         self.assertEqual(len(audit["identical_code_exclusions"]), 1)
-        self.assertEqual(len(audit["close_relative_exclusions"]), 1)
-        self.assertEqual(audit["shortfall_count"], 2)
+        self.assertEqual(len(audit["core_selected_program_ids"]), 3)
+        self.assertIn(
+            audit["wildcard_selected_program_id"],
+            {sibling_a.id, sibling_b.id},
+        )
+        self.assertEqual(
+            audit["wildcard_conflicts_with_core"][0]["reasons"], ["siblings"]
+        )
+        self.assertEqual(audit["shortfall_count"], 1)
         self.assertEqual(
             audit["shortfall_reason"],
             "insufficient_distinct_eligible_cells_after_exclusions",
         )
+
+    def test_hub_and_leaves_exact_core_avoids_greedy_shortfall(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        founder_leaf = _program("founder-leaf")
+        hub = _program("hub", parent_id=founder_leaf.id)
+        descendant_leaf = _program("descendant-leaf", parent_id=hub.id)
+        _install_live(database, parent)
+        # Preserve the adversarial hub-first order under which the former
+        # random-greedy pass returned only the hub.
+        for cell, owner in enumerate((hub, founder_leaf, descendant_leaf)):
+            _install_owner(database, owner, cell)
+
+        with patch("openevolve.database.random.shuffle", side_effect=lambda items: None):
+            selected, audit = database.sample_true_diverse_inspirations(
+                parent, target_island=0, n=2
+            )
+            selected_with_wildcard, wildcard_audit = (
+                database.sample_true_diverse_inspirations(
+                    parent, target_island=0, n=3
+                )
+            )
+
+        self.assertEqual(
+            {program.id for program in selected},
+            {founder_leaf.id, descendant_leaf.id},
+        )
+        self.assertFalse(audit["wildcard_enabled"])
+        self.assertEqual(audit["conflict_edge_count"], 2)
+        self.assertEqual(audit["maximum_compatible_core_count_found"], 2)
+        self.assertTrue(audit["exact_optimality_established"])
+        self.assertEqual(
+            {program.id for program in selected_with_wildcard},
+            {founder_leaf.id, hub.id, descendant_leaf.id},
+        )
+        self.assertEqual(
+            wildcard_audit["core_selected_program_ids"],
+            [founder_leaf.id, descendant_leaf.id],
+        )
+        self.assertEqual(wildcard_audit["wildcard_selected_program_id"], hub.id)
+        self.assertEqual(
+            {
+                conflict["core_program_id"]: conflict["reasons"]
+                for conflict in wildcard_audit["wildcard_conflicts_with_core"]
+            },
+            {
+                founder_leaf.id: ["direct_parent_child"],
+                descendant_leaf.id: ["direct_parent_child"],
+            },
+        )
+
+    def test_zero_and_one_requested_counts_have_no_wildcard(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        candidates = [_program(f"candidate-{index}") for index in range(3)]
+        _install_live(database, parent)
+        for cell, candidate in enumerate(candidates):
+            _install_owner(database, candidate, cell)
+
+        selected_zero, zero_audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=0
+        )
+        self.assertEqual(selected_zero, [])
+        self.assertEqual(zero_audit["core_target_count"], 0)
+        self.assertEqual(zero_audit["core_upper_bound"], 0)
+        self.assertFalse(zero_audit["wildcard_enabled"])
+
+        selected_one, one_audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=1
+        )
+        self.assertEqual(len(selected_one), 1)
+        self.assertEqual(len(one_audit["core_selected_program_ids"]), 1)
+        self.assertFalse(one_audit["wildcard_enabled"])
+        self.assertIsNone(one_audit["wildcard_selected_program_id"])
+
+    def test_core_and_wildcard_cardinality_policy(self) -> None:
+        cases = (
+            (3, 3, 2, 1),
+            (5, 5, 4, 1),
+            (5, 3, 2, 1),
+            (5, 1, 0, 1),
+        )
+        for requested, candidate_count, expected_core, expected_wildcards in cases:
+            with self.subTest(requested=requested, candidate_count=candidate_count):
+                database = _database()
+                parent = _program("parent", island=1)
+                _install_live(database, parent)
+                for cell in range(candidate_count):
+                    _install_owner(database, _program(f"candidate-{cell}"), cell)
+
+                selected, audit = database.sample_true_diverse_inspirations(
+                    parent, target_island=0, n=requested
+                )
+
+                self.assertEqual(len(audit["core_selected_program_ids"]), expected_core)
+                self.assertEqual(
+                    audit["core_upper_bound"],
+                    min(requested - 1, max(0, candidate_count - 1)),
+                )
+                self.assertTrue(audit["wildcard_enabled"])
+                self.assertEqual(
+                    audit["wildcard_selected_program_id"] is not None,
+                    bool(expected_wildcards),
+                )
+                self.assertEqual(len(selected), expected_core + expected_wildcards)
+                self.assertEqual(len({program.id for program in selected}), len(selected))
+                self.assertNotIn(
+                    audit["wildcard_selected_program_id"],
+                    audit["core_selected_program_ids"],
+                )
+                expected_ids = list(audit["core_selected_program_ids"])
+                if audit["wildcard_selected_program_id"] is not None:
+                    expected_ids.append(audit["wildcard_selected_program_id"])
+                    self.assertEqual(
+                        audit["wildcard_selected_map_cell"],
+                        audit["selected_map_cells"][
+                            audit["wildcard_selected_program_id"]
+                        ],
+                    )
+                self.assertEqual(audit["selected_program_ids"], expected_ids)
+                self.assertEqual(audit["returned_count"], len(expected_ids))
+
+    def test_wildcard_can_cross_each_lineage_conflict(self) -> None:
+        for relationship in (
+            "direct_parent_child",
+            "siblings",
+            "migration_clone",
+            "recent_ancestor_descendant",
+            "recent_common_ancestor",
+        ):
+            with self.subTest(relationship=relationship):
+                database = _database()
+                parent = _program("prompt-parent", island=1)
+                _install_live(database, parent)
+
+                if relationship == "direct_parent_child":
+                    first = _program("first")
+                    second = _program("second", parent_id=first.id)
+                elif relationship == "siblings":
+                    first = _program("first", parent_id="retired-parent")
+                    second = _program("second", parent_id="retired-parent")
+                elif relationship == "migration_clone":
+                    first = _program("first")
+                    second = _program(
+                        "second",
+                        parent_id=first.id,
+                        metadata={"migrant": True, "migration_source_island": 1},
+                    )
+                elif relationship == "recent_ancestor_descendant":
+                    root = _program("root")
+                    first = _program("first", parent_id=root.id)
+                    middle = _program("middle", parent_id=first.id)
+                    for lineage_program in (root, middle):
+                        _install_live(database, lineage_program)
+                    second = _program("second", parent_id=middle.id)
+                else:
+                    root = _program("root")
+                    shared = _program("shared", parent_id=root.id)
+                    left = _program("left", parent_id=shared.id)
+                    right = _program("right", parent_id=shared.id)
+                    for lineage_program in (root, shared, left, right):
+                        _install_live(database, lineage_program)
+                    first = _program("first", parent_id=left.id)
+                    second = _program("second", parent_id=right.id)
+
+                _install_owner(database, first, 0)
+                _install_owner(database, second, 1)
+                selected, audit = database.sample_true_diverse_inspirations(
+                    parent, target_island=0, n=3
+                )
+
+                self.assertEqual(len(selected), 2)
+                self.assertEqual(len(audit["core_selected_program_ids"]), 1)
+                wildcard_id = audit["wildcard_selected_program_id"]
+                self.assertIn(wildcard_id, {first.id, second.id})
+                self.assertNotIn(wildcard_id, audit["core_selected_program_ids"])
+                self.assertNotIn(wildcard_id, audit["close_relative_exclusions"])
+                self.assertNotIn(
+                    wildcard_id,
+                    {
+                        detail["program_id"]
+                        for detail in audit["exclusion_details"]
+                    },
+                )
+                self.assertEqual(
+                    audit["wildcard_conflicts_with_core"],
+                    [
+                        {
+                            "core_program_id": audit["core_selected_program_ids"][0],
+                            "reasons": [relationship],
+                        }
+                    ],
+                )
+
+    def test_wildcard_never_duplicates_core_source(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        first = _program("first", code="def shared(): return 1")
+        duplicate = _program("duplicate", code=first.code)
+        _install_live(database, parent)
+        _install_owner(database, first, 0)
+        _install_owner(database, duplicate, 1)
+
+        selected, audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=3
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(audit["core_selected_program_ids"]), 1)
+        self.assertIsNone(audit["wildcard_selected_program_id"])
+        self.assertEqual(audit["conflict_edge_count"], 1)
+        self.assertEqual(audit["shortfall_count"], 2)
+
+    def test_selection_does_not_prefer_fitness_or_rank(self) -> None:
+        def selected_id(scores: tuple[float, float]) -> str:
+            database = _database()
+            parent = _program("parent", island=1)
+            _install_live(database, parent)
+            _install_owner(database, _program("first", score=scores[0]), 0)
+            _install_owner(database, _program("second", score=scores[1]), 1)
+            random.seed(811)
+            selected, _ = database.sample_true_diverse_inspirations(
+                parent, target_island=0, n=1
+            )
+            return selected[0].id
+
+        self.assertEqual(selected_id((0.99, 0.01)), selected_id((0.01, 0.99)))
+
+    def test_tied_maximum_cores_are_seeded_reproducible(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        _install_live(database, parent)
+        for cell in range(4):
+            _install_owner(database, _program(f"candidate-{cell}"), cell)
+
+        random.seed(991)
+        first, first_audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=2
+        )
+        random.seed(991)
+        second, second_audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=2
+        )
+
+        self.assertEqual(
+            [program.id for program in first], [program.id for program in second]
+        )
+        self.assertEqual(
+            first_audit["core_selected_map_cells"],
+            second_audit["core_selected_map_cells"],
+        )
+        self.assertTrue(first_audit["exact_optimality_established"])
+
+    def test_search_budget_fallback_is_explicit_and_seeded(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        founder_leaf = _program("founder-leaf")
+        hub = _program("hub", parent_id=founder_leaf.id)
+        descendant_leaf = _program("descendant-leaf", parent_id=hub.id)
+        _install_live(database, parent)
+        for cell, candidate in enumerate((hub, founder_leaf, descendant_leaf)):
+            _install_owner(database, candidate, cell)
+
+        random.seed(0)
+        with patch("openevolve.database._TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT", 0):
+            first, first_audit = database.sample_true_diverse_inspirations(
+                parent, target_island=0, n=2
+            )
+        random.seed(0)
+        with patch("openevolve.database._TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT", 0):
+            second, second_audit = database.sample_true_diverse_inspirations(
+                parent, target_island=0, n=2
+            )
+
+        self.assertEqual(
+            [program.id for program in first], [program.id for program in second]
+        )
+        self.assertEqual([program.id for program in first], [hub.id])
+        self.assertEqual(first_audit["maximum_compatible_core_count_found"], 1)
+        self.assertEqual(first_audit["core_upper_bound"], 2)
+        self.assertFalse(first_audit["exact_optimality_established"])
+        self.assertEqual(
+            first_audit["fallback_reason"],
+            "maximum_compatible_core_search_budget_exceeded",
+        )
+        self.assertEqual(first_audit, second_audit)
 
     def test_ultimate_founder_alone_does_not_collapse_distinct_branches(self) -> None:
         database = _database()
@@ -269,6 +564,7 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
         )
 
         self.assertEqual([program.id for program in selected], [valid_zero.id])
+        self.assertEqual(audit["individually_eligible_candidate_count"], 1)
         reasons = {
             item["program_id"]: item["reason"]
             for item in audit["ineligible_exclusions"]
@@ -404,6 +700,8 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
         self.assertEqual([program.id for program in selected], [owner.id])
         self.assertEqual(audit["selected_map_cells"], {owner.id: [8]})
         self.assertEqual(audit["shortfall_count"], 1)
+        self.assertFalse(audit["wildcard_enabled"])
+        self.assertEqual(json.loads(json.dumps(audit)), audit)
 
 
 if __name__ == "__main__":

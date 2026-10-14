@@ -26,6 +26,12 @@ from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_sco
 logger = logging.getLogger(__name__)
 
 
+# True-diversity candidate pools are normally small MAP archives. Cap the
+# exponential part of the exact compatibility search; the seeded candidate
+# order also makes the simple fallback reproducible.
+_TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT = 250_000
+
+
 class InvalidFeatureDescriptorError(ValueError):
     """A configured fixed-grid descriptor cannot be assigned to a physical bin."""
 
@@ -2031,10 +2037,12 @@ class ProgramDatabase:
         ``map_elites_cell`` metadata is never used to establish ownership.
 
         In addition to distinct cells, the selector avoids duplicate source and
-        obvious close relatives of the parent, top prompt examples, and already
-        selected inspirations.  The lineage check is deliberately best-effort:
-        it follows only live ``parent_id`` links to a small bounded depth and
-        never interprets MAP replacement provenance as ancestry.
+        obvious close relatives of the parent and top prompt examples. Core
+        inspirations are mutually compatible under those same checks; when
+        more than two are requested, one final wildcard may override only the
+        core's lineage conflicts. The lineage check is deliberately
+        best-effort: it follows only live ``parent_id`` links to a small bounded
+        depth and never interprets MAP replacement provenance as ancestry.
 
         Args:
             parent: Current mutation parent. It may belong to another island
@@ -2083,6 +2091,23 @@ class ProgramDatabase:
             "lineage_depth": lineage_depth,
             "occupied_cell_count": len(self.island_feature_maps[target_island]),
             "eligible_owner_count": 0,
+            "individually_eligible_candidate_count": 0,
+            "conflict_edge_count": 0,
+            "core_target_count": (
+                requested_count - 1 if requested_count > 2 else requested_count
+            ),
+            "core_upper_bound": 0,
+            "maximum_compatible_core_count_found": 0,
+            "core_selected_program_ids": [],
+            "core_selected_map_cells": {},
+            "wildcard_enabled": False,
+            "wildcard_selected_program_id": None,
+            "wildcard_selected_map_cell": None,
+            "wildcard_conflicts_with_core": [],
+            "exact_optimality_established": True,
+            "fallback_reason": None,
+            "core_search_nodes_visited": 0,
+            "core_search_node_limit": _TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT,
             "shortfall_count": requested_count,
             "shortfall_reason": None,
         }
@@ -2210,55 +2235,127 @@ class ProgramDatabase:
 
             eligible.append((cell_key, owner))
 
-        audit["eligible_owner_count"] = len(eligible)
+        eligible_count = len(eligible)
+        audit["eligible_owner_count"] = eligible_count
+        audit["individually_eligible_candidate_count"] = eligible_count
         random.shuffle(eligible)
 
-        selected: List[Program] = []
-        selected_cells: Dict[str, List[int]] = {}
-        selected_descriptors: Dict[str, Dict[str, Any]] = {}
-        selected_source_islands: Dict[str, int] = {}
-        selected_programs: List[Program] = []
-        selected_codes: Set[str] = set()
+        # Build one undirected conflict graph from the same exact-code and
+        # B-lite relationships previously consulted by the greedy pass.
+        conflicts: List[Set[int]] = [set() for _ in eligible]
+        conflict_reasons: Dict[Tuple[int, int], List[str]] = {}
+        for first_index in range(eligible_count):
+            first_program = eligible[first_index][1]
+            for second_index in range(first_index + 1, eligible_count):
+                second_program = eligible[second_index][1]
+                reasons = self._true_diversity_pair_conflict_reasons(
+                    first_program, second_program, lineage_depth
+                )
+                if not reasons:
+                    continue
+                conflicts[first_index].add(second_index)
+                conflicts[second_index].add(first_index)
+                conflict_reasons[(first_index, second_index)] = reasons
 
-        for cell_key, candidate in eligible:
-            if len(selected) >= requested_count:
-                break
+        audit["conflict_edge_count"] = len(conflict_reasons)
+        wildcard_enabled = requested_count > 2 and eligible_count > 0
+        audit["wildcard_enabled"] = wildcard_enabled
+        if wildcard_enabled:
+            core_upper_bound = min(requested_count - 1, max(0, eligible_count - 1))
+        else:
+            core_upper_bound = min(requested_count, eligible_count)
+        audit["core_upper_bound"] = core_upper_bound
 
-            if candidate.code in selected_codes:
+        (
+            core_indices,
+            exact_optimality_established,
+            fallback_reason,
+            search_nodes_visited,
+        ) = self._true_diversity_maximum_compatible_core(
+            conflicts,
+            core_upper_bound,
+            _TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT,
+        )
+        audit["maximum_compatible_core_count_found"] = len(core_indices)
+        audit["exact_optimality_established"] = exact_optimality_established
+        audit["fallback_reason"] = fallback_reason
+        audit["core_search_nodes_visited"] = search_nodes_visited
+        audit["core_search_node_limit"] = _TRUE_DIVERSITY_EXACT_SEARCH_NODE_LIMIT
+
+        core_index_set = set(core_indices)
+        wildcard_index: Optional[int] = None
+        if wildcard_enabled:
+            core_codes = {eligible[index][1].code for index in core_indices}
+            wildcard_candidates = [
+                index
+                for index in range(eligible_count)
+                if index not in core_index_set
+                and eligible[index][1].code not in core_codes
+            ]
+            if wildcard_candidates:
+                wildcard_index = random.choice(wildcard_candidates)
+
+        selected_indices = list(core_indices)
+        if wildcard_index is not None:
+            selected_indices.append(wildcard_index)
+        selected_index_set = set(selected_indices)
+
+        # Preserve the legacy exclusion fields for candidates which could not
+        # join the compatible core. The wildcard is deliberately not an
+        # exclusion even when it conflicts with that core.
+        for candidate_index, (cell_key, candidate) in enumerate(eligible):
+            if candidate_index in selected_index_set:
+                continue
+            duplicate_core_index = next(
+                (
+                    core_index
+                    for core_index in core_indices
+                    if eligible[core_index][1].code == candidate.code
+                ),
+                None,
+            )
+            if duplicate_core_index is not None:
                 audit["identical_code_exclusions"].append(candidate.id)
                 audit["exclusion_details"].append(
                     {
                         "program_id": candidate.id,
                         "cell": self._true_diversity_cell_coordinates(cell_key),
                         "reason": "identical_code",
-                        "related_program_id": next(
-                            selected_program.id
-                            for selected_program in selected_programs
-                            if selected_program.code == candidate.code
-                        ),
+                        "related_program_id": eligible[duplicate_core_index][1].id,
                     }
                 )
                 continue
 
-            relationship = self._true_diversity_relationship(
-                candidate, selected_programs, lineage_depth
-            )
-            if relationship is not None:
-                reason, related_program_id = relationship
+            for core_index in core_indices:
+                pair_key = (
+                    (candidate_index, core_index)
+                    if candidate_index < core_index
+                    else (core_index, candidate_index)
+                )
+                reasons = conflict_reasons.get(pair_key, [])
+                lineage_reasons = [
+                    reason for reason in reasons if reason != "identical_code"
+                ]
+                if not lineage_reasons:
+                    continue
                 audit["close_relative_exclusions"].append(candidate.id)
                 audit["exclusion_details"].append(
                     {
                         "program_id": candidate.id,
                         "cell": self._true_diversity_cell_coordinates(cell_key),
-                        "reason": reason,
-                        "related_program_id": related_program_id,
+                        "reason": lineage_reasons[0],
+                        "related_program_id": eligible[core_index][1].id,
                     }
                 )
-                continue
+                break
 
+        selected: List[Program] = []
+        selected_cells: Dict[str, List[int]] = {}
+        selected_descriptors: Dict[str, Dict[str, Any]] = {}
+        selected_source_islands: Dict[str, int] = {}
+        for selected_index in selected_indices:
+            cell_key, candidate = eligible[selected_index]
             selected.append(candidate)
-            selected_programs.append(candidate)
-            selected_codes.add(candidate.code)
             selected_cells[candidate.id] = self._true_diversity_cell_coordinates(cell_key)
             selected_descriptors[candidate.id] = {
                 dimension: self._true_diversity_json_scalar(
@@ -2268,6 +2365,38 @@ class ProgramDatabase:
                 if dimension in candidate.metrics
             }
             selected_source_islands[candidate.id] = target_island
+
+        audit["core_selected_program_ids"] = [
+            eligible[index][1].id for index in core_indices
+        ]
+        audit["core_selected_map_cells"] = {
+            eligible[index][1].id: self._true_diversity_cell_coordinates(
+                eligible[index][0]
+            )
+            for index in core_indices
+        }
+        if wildcard_index is not None:
+            wildcard_cell, wildcard = eligible[wildcard_index]
+            audit["wildcard_selected_program_id"] = wildcard.id
+            audit["wildcard_selected_map_cell"] = (
+                self._true_diversity_cell_coordinates(wildcard_cell)
+            )
+            wildcard_conflicts: List[Dict[str, Any]] = []
+            for core_index in core_indices:
+                pair_key = (
+                    (wildcard_index, core_index)
+                    if wildcard_index < core_index
+                    else (core_index, wildcard_index)
+                )
+                reasons = conflict_reasons.get(pair_key)
+                if reasons:
+                    wildcard_conflicts.append(
+                        {
+                            "core_program_id": eligible[core_index][1].id,
+                            "reasons": list(reasons),
+                        }
+                    )
+            audit["wildcard_conflicts_with_core"] = wildcard_conflicts
 
         audit["returned_count"] = len(selected)
         audit["selected_program_ids"] = [program.id for program in selected]
@@ -2290,6 +2419,88 @@ class ProgramDatabase:
             target_island,
         )
         return selected, audit
+
+    @staticmethod
+    def _true_diversity_maximum_compatible_core(
+        conflicts: List[Set[int]],
+        upper_bound: int,
+        node_limit: int,
+    ) -> Tuple[List[int], bool, Optional[str], int]:
+        """Find a maximum compatible subset up to ``upper_bound``.
+
+        Candidate order is randomized by the caller, so returning the first
+        exact solution preserves seeded exploration among tied maximum sets.
+        Searches descend from the requested cap; exhausting all larger sizes
+        proves maximum cardinality. If the node budget is exceeded, a simple
+        greedy pass over that same seeded order provides a bounded fallback
+        without claiming optimality.
+        """
+        candidate_count = len(conflicts)
+        upper_bound = min(max(0, int(upper_bound)), candidate_count)
+        if upper_bound == 0:
+            return [], True, None, 0
+
+        node_limit = max(0, int(node_limit))
+        nodes_visited = 0
+        budget_exceeded = False
+
+        def find_size(available: List[int], needed: int) -> Optional[List[int]]:
+            nonlocal nodes_visited, budget_exceeded
+            if budget_exceeded:
+                return None
+            if nodes_visited >= node_limit:
+                budget_exceeded = True
+                return None
+            nodes_visited += 1
+            if needed == 0:
+                return []
+            if len(available) < needed:
+                return None
+
+            last_start = len(available) - needed
+            for position in range(last_start + 1):
+                candidate_index = available[position]
+                remaining = [
+                    other_index
+                    for other_index in available[position + 1 :]
+                    if other_index not in conflicts[candidate_index]
+                ]
+                if len(remaining) < needed - 1:
+                    continue
+                suffix = find_size(remaining, needed - 1)
+                if suffix is not None:
+                    return [candidate_index, *suffix]
+                if budget_exceeded:
+                    return None
+            return None
+
+        all_candidates = list(range(candidate_count))
+        fallback_reason = "maximum_compatible_core_search_budget_exceeded"
+        try:
+            for target_size in range(upper_bound, -1, -1):
+                exact_core = find_size(all_candidates, target_size)
+                if budget_exceeded:
+                    break
+                if exact_core is not None:
+                    return exact_core, True, None, nodes_visited
+        except RecursionError:
+            fallback_reason = "maximum_compatible_core_search_recursion_limit_exceeded"
+
+        fallback_core: List[int] = []
+        for candidate_index in all_candidates:
+            if len(fallback_core) >= upper_bound:
+                break
+            if all(
+                selected_index not in conflicts[candidate_index]
+                for selected_index in fallback_core
+            ):
+                fallback_core.append(candidate_index)
+        return (
+            fallback_core,
+            False,
+            fallback_reason,
+            nodes_visited,
+        )
 
     @staticmethod
     def _true_diversity_cell_coordinates(cell_key: str) -> List[int]:
@@ -2401,6 +2612,20 @@ class ProgramDatabase:
         if first_ancestors.intersection(second_ancestors):
             return "recent_common_ancestor"
         return None
+
+    def _true_diversity_pair_conflict_reasons(
+        self, first: Program, second: Program, lineage_depth: int
+    ) -> List[str]:
+        """Return exact-code and B-lite reasons making a pair incompatible."""
+        reasons: List[str] = []
+        if first.code == second.code:
+            reasons.append("identical_code")
+        relationship = self._true_diversity_pair_relationship(
+            first, second, lineage_depth
+        )
+        if relationship is not None:
+            reasons.append(relationship)
+        return reasons
 
     def _true_diversity_relationship(
         self,

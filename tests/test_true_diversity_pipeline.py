@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+import pickle
 import random
 import tempfile
 import unittest
@@ -107,6 +108,7 @@ class TestTrueDiversityConfigurationAndPrompt(unittest.TestCase):
         self.assertNotIn("## Diverse Programs", user_prompt)
         self.assertEqual(user_prompt.count("## Inspiration Programs"), 1)
         self.assertEqual(user_prompt.count("def map_owner()"), 1)
+        self.assertNotIn("wildcard", user_prompt.lower())
         self.assertIn("### Program 1 (Score: 0.9000)", user_prompt)
         self.assertIn("### Diverse Inspiration 1 (Score: 0.4000)", user_prompt)
         clarification = (
@@ -256,6 +258,19 @@ class TestTrueDiversityControllerWiring(unittest.TestCase):
         audit = {
             "true_diversity": True,
             "target_island": 0,
+            "individually_eligible_candidate_count": 2,
+            "conflict_edge_count": 1,
+            "core_target_count": 2,
+            "core_upper_bound": 1,
+            "maximum_compatible_core_count_found": 1,
+            "core_selected_program_ids": [inspiration.id],
+            "core_selected_map_cells": {inspiration.id: [3, 1]},
+            "wildcard_enabled": False,
+            "wildcard_selected_program_id": None,
+            "wildcard_selected_map_cell": None,
+            "wildcard_conflicts_with_core": [],
+            "exact_optimality_established": True,
+            "fallback_reason": None,
             "selected_map_cells": {inspiration.id: [3, 1]},
             "selected_descriptor_values": {
                 inspiration.id: {"combined_score": 0.4}
@@ -308,6 +323,9 @@ class TestTrueDiversityControllerWiring(unittest.TestCase):
             },
         )
         self.assertIs(result.true_diversity_provenance, audit)
+        round_tripped = pickle.loads(pickle.dumps(result))
+        self.assertEqual(round_tripped.true_diversity_provenance, audit)
+        self.assertEqual(json.loads(json.dumps(audit)), audit)
 
 
 class TestTrueDiversityTraceWiring(unittest.TestCase):
@@ -392,6 +410,19 @@ class TestTrueDiversityTraceWiring(unittest.TestCase):
             "requested_count": 2,
             "returned_count": 1,
             "target_island": 0,
+            "individually_eligible_candidate_count": 2,
+            "conflict_edge_count": 1,
+            "core_target_count": 2,
+            "core_upper_bound": 2,
+            "maximum_compatible_core_count_found": 1,
+            "core_selected_program_ids": ["map_owner"],
+            "core_selected_map_cells": {"map_owner": [1, 2]},
+            "wildcard_enabled": False,
+            "wildcard_selected_program_id": None,
+            "wildcard_selected_map_cell": None,
+            "wildcard_conflicts_with_core": [],
+            "exact_optimality_established": True,
+            "fallback_reason": None,
             "selected_program_ids": ["map_owner"],
             "selected_map_cells": {"map_owner": [1, 2]},
             "selected_descriptor_values": {"map_owner": {"latency": 4.5}},
