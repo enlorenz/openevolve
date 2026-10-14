@@ -57,9 +57,20 @@ class TestTrueDiversityConfigurationAndPrompt(unittest.TestCase):
 
         self.assertEqual(missing_prompt, false_prompt)
         self.assertIn("## Diverse Programs", false_prompt)
+        self.assertIn("### Program 1 (Score: 0.9000)", false_prompt)
+        self.assertIn("### Program D1 (Score:", false_prompt)
+        self.assertIn("### Program D2 (Score:", false_prompt)
         self.assertIn("def legacy_rank_2()", false_prompt)
         self.assertIn("def legacy_rank_3()", false_prompt)
         self.assertIn("def legacy_inspiration()", false_prompt)
+        legacy_inspiration_text = (
+            "These programs represent diverse approaches and creative solutions "
+            "that may inspire new ideas:"
+        )
+        self.assertIn(legacy_inspiration_text, missing_prompt)
+        self.assertIn(legacy_inspiration_text, false_prompt)
+        self.assertNotIn("not necessarily successful solutions", missing_prompt)
+        self.assertNotIn("not necessarily successful solutions", false_prompt)
 
     def test_true_prompt_has_one_central_diverse_section_and_map_context(self):
         config = Config()
@@ -96,6 +107,19 @@ class TestTrueDiversityConfigurationAndPrompt(unittest.TestCase):
         self.assertNotIn("## Diverse Programs", user_prompt)
         self.assertEqual(user_prompt.count("## Inspiration Programs"), 1)
         self.assertEqual(user_prompt.count("def map_owner()"), 1)
+        self.assertIn("### Program 1 (Score: 0.9000)", user_prompt)
+        self.assertIn("### Diverse Inspiration 1 (Score: 0.4000)", user_prompt)
+        clarification = (
+            "These programs represent different behavioral niches, not necessarily "
+            "successful solutions. Their overall performance may be strong, weak, or "
+            "poor. Treat them as sources of potentially useful mechanisms or ideas "
+            "rather than solutions to imitate wholesale."
+        )
+        self.assertEqual(user_prompt.count(clarification), 1)
+        self.assertNotIn(
+            "These programs represent diverse approaches and creative solutions",
+            user_prompt,
+        )
         self.assertIn(
             "MAP niche: cell=[2, 4]; descriptors: latency=4; source island=1",
             user_prompt,

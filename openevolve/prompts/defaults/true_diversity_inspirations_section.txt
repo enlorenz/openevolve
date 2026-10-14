@@ -1,0 +1,5 @@
+## Inspiration Programs
+
+These programs represent different behavioral niches, not necessarily successful solutions. Their overall performance may be strong, weak, or poor. Treat them as sources of potentially useful mechanisms or ideas rather than solutions to imitate wholesale.
+
+{inspiration_programs}

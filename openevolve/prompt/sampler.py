@@ -487,12 +487,17 @@ class PromptSampler:
             return ""
 
         # Get templates
-        inspirations_section_template = self.template_manager.get_template("inspirations_section")
         if self.config.true_diversity:
+            inspirations_section_template = self.template_manager.get_template(
+                "true_diversity_inspirations_section"
+            )
             inspiration_program_template = self.template_manager.get_template(
                 "true_diversity_inspiration_program"
             )
         else:
+            inspirations_section_template = self.template_manager.get_template(
+                "inspirations_section"
+            )
             inspiration_program_template = self.template_manager.get_template(
                 "inspiration_program"
             )
