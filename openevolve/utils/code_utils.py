@@ -2,11 +2,160 @@
 Utilities for code parsing, diffing, and manipulation
 """
 
+import ast
 import re
+import tokenize
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 
 _ProgramT = TypeVar("_ProgramT")
+
+
+@lru_cache(maxsize=4096)
+def code_without_comments_and_docstrings(source: str) -> str:
+    """Return Python source with commentary units removed.
+
+    This is an exact-source comparison key, not a normalized or semantic
+    representation. Comments and genuine leading docstring statements are
+    removed directly from the original string; every other character is
+    retained character-for-character. If ``source`` cannot be parsed as
+    Python, it is returned unchanged. The bounded cache avoids reparsing the
+    same program during pairwise diversity checks.
+
+    Commentary units include the whole physical line for a comment-only or
+    docstring-only line. For inline comments, the horizontal whitespace that
+    separates the comment from surviving code is also removed. A same-line
+    docstring followed by another statement consumes its following semicolon
+    and adjacent horizontal whitespace.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError, UnicodeError):
+        return source
+
+    # Unlike ``str.splitlines()``, this recognizes only the universal-newline
+    # sequences that Python treats as physical line endings. In particular, a
+    # form feed is horizontal indentation, not a new source line.
+    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z", source)
+    try:
+        line_iterator = iter(lines)
+        tokens = list(tokenize.generate_tokens(lambda: next(line_iterator, "")))
+    except (IndentationError, SyntaxError, tokenize.TokenError, UnicodeError):
+        # Parsing has already succeeded, so this is only a defensive fallback:
+        # never partially strip source when Python-aware analysis is incomplete.
+        return source
+
+    line_starts: List[int] = []
+    offset = 0
+    for line in lines:
+        line_starts.append(offset)
+        offset += len(line)
+
+    def line_bounds(line_number: int) -> Tuple[int, int, int]:
+        """Return a physical line's start, content end, and full end offsets."""
+        line = lines[line_number - 1]
+        start = line_starts[line_number - 1]
+        full_end = start + len(line)
+        if line.endswith("\r\n"):
+            content_end = full_end - 2
+        elif line.endswith(("\r", "\n")):
+            content_end = full_end - 1
+        else:
+            content_end = full_end
+        return start, content_end, full_end
+
+    def token_offset(position: Tuple[int, int]) -> int:
+        line_number, column = position
+        return line_starts[line_number - 1] + column
+
+    def ast_offset(line_number: int, byte_column: int) -> int:
+        # AST columns are UTF-8 byte offsets; tokenizer columns and Python
+        # string slicing use Unicode character offsets.
+        line = lines[line_number - 1]
+        character_column = len(line.encode("utf-8")[:byte_column].decode("utf-8"))
+        return line_starts[line_number - 1] + character_column
+
+    removals: List[Tuple[int, int]] = []
+
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        start = token_offset(token.start)
+        end = token_offset(token.end)
+        line_start, _, line_end = line_bounds(token.start[0])
+        before_comment = source[line_start:start]
+        if not before_comment.strip(" \t\f"):
+            removals.append((line_start, line_end))
+            continue
+
+        # The separating horizontal whitespace is part of an inline comment's
+        # commentary unit. Do not touch any other surviving whitespace.
+        while start > line_start and source[start - 1] in " \t\f":
+            start -= 1
+        removals.append((start, end))
+
+    docstring_nodes: List[ast.Expr] = []
+    containers = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, containers) or not node.body:
+            continue
+        first_statement = node.body[0]
+        if (
+            isinstance(first_statement, ast.Expr)
+            and isinstance(first_statement.value, ast.Constant)
+            and isinstance(first_statement.value.value, str)
+        ):
+            docstring_nodes.append(first_statement)
+
+    for node in docstring_nodes:
+        if node.end_lineno is None or node.end_col_offset is None:
+            # All supported Python versions provide end positions. Falling back
+            # to raw source is safer than constructing a partially stripped key.
+            return source
+
+        start = ast_offset(node.lineno, node.col_offset)
+        end = ast_offset(node.end_lineno, node.end_col_offset)
+        start_line, _, _ = line_bounds(node.lineno)
+        _, end_line_content, end_line = line_bounds(node.end_lineno)
+        prefix = source[start_line:start]
+        suffix = source[end:end_line_content]
+
+        # A statement that occupies its physical line is removed together with
+        # indentation and newline. A trailing semicolon and/or comment is still
+        # part of that otherwise commentary-only line.
+        suffix_is_commentary_only = re.fullmatch(
+            r"[ \t\f]*(?:;[ \t\f]*)?(?:\#.*)?", suffix
+        )
+        if not prefix.strip(" \t\f") and suffix_is_commentary_only:
+            removals.append((start_line, end_line))
+            continue
+
+        # For ``def f(): "doc"; return 1``, consume the right-hand separator
+        # and its whitespace, leaving ``def f(): return 1`` without formatting
+        # or otherwise changing the surrounding executable source.
+        separator = re.match(r"[ \t\f]*;[ \t\f]*", suffix)
+        if separator:
+            end += separator.end()
+        removals.append((start, end))
+
+    if not removals:
+        return source
+
+    merged: List[List[int]] = []
+    for start, end in sorted(removals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    parts: List[str] = []
+    previous_end = 0
+    for start, end in merged:
+        parts.append(source[previous_end:start])
+        previous_end = end
+    parts.append(source[previous_end:])
+    return "".join(parts)
 
 
 def select_distinct_code_programs(
@@ -14,11 +163,12 @@ def select_distinct_code_programs(
     limit: int,
     code_getter: Callable[[_ProgramT], str],
 ) -> Tuple[List[_ProgramT], List[_ProgramT]]:
-    """Select the first ``limit`` programs with byte-distinct source code.
+    """Select the first ``limit`` commentary-distinct Python programs.
 
     The input is assumed to already be fitness-ranked. This helper never sorts
     or considers IDs, lineage, metrics, or metadata; it only preserves the
-    input order while skipping exact source-string duplicates.
+    input order while skipping sources that differ only in Python comments or
+    genuine docstrings. Sources that fail Python parsing retain raw equality.
 
     Returns:
         A pair containing the selected programs and duplicate-code programs
@@ -26,17 +176,17 @@ def select_distinct_code_programs(
     """
     selected: List[_ProgramT] = []
     skipped_duplicates: List[_ProgramT] = []
-    seen_codes: Set[str] = set()
+    seen_code_keys: Set[str] = set()
     requested_count = max(0, int(limit))
 
     for program in ranked_programs:
         if len(selected) >= requested_count:
             break
-        code = code_getter(program)
-        if code in seen_codes:
+        comparison_code = code_without_comments_and_docstrings(code_getter(program))
+        if comparison_code in seen_code_keys:
             skipped_duplicates.append(program)
             continue
-        seen_codes.add(code)
+        seen_code_keys.add(comparison_code)
         selected.append(program)
 
     return selected, skipped_duplicates

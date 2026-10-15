@@ -122,6 +122,161 @@ class TrueDiversityDatabaseTests(unittest.TestCase):
         )
         json.dumps(audit)
 
+    def test_commentary_only_variants_match_parent_and_top_baseline(self) -> None:
+        database = _database()
+        parent = _program(
+            "parent",
+            code=(
+                "def policy():\n"
+                "    # Parent explanation.\n"
+                "    return 1\n"
+            ),
+            island=1,
+        )
+        top = _program(
+            "top",
+            code=(
+                "def top_policy():\n"
+                "    \"\"\"Top strategy.\"\"\"\n"
+                "    return 2\n"
+            ),
+        )
+        parent_without_comment = _program(
+            "parent-without-comment",
+            code="def policy():\n    return 1\n",
+        )
+        top_with_different_docstring = _program(
+            "top-with-different-docstring",
+            code=(
+                "def top_policy():\n"
+                "    \"\"\"A different, multi-line\n"
+                "    strategy description.\n"
+                "    \"\"\"\n"
+                "    return 2\n"
+            ),
+        )
+        executable_difference = _program(
+            "executable-difference",
+            code="def policy():\n    return 3\n",
+        )
+
+        _install_live(database, parent)
+        _install_owner(database, top, 0)
+        _install_owner(database, parent_without_comment, 1)
+        _install_owner(database, top_with_different_docstring, 2)
+        _install_owner(database, executable_difference, 3)
+
+        selected, audit = database.sample_true_diverse_inspirations(
+            parent,
+            target_island=0,
+            n=10,
+            excluded_program_ids={top.id},
+        )
+
+        self.assertEqual(
+            [program.id for program in selected], [executable_difference.id]
+        )
+        self.assertCountEqual(
+            audit["identical_code_exclusions"],
+            [parent_without_comment.id, top_with_different_docstring.id],
+        )
+        duplicate_of = {
+            detail["program_id"]: detail["related_program_id"]
+            for detail in audit["exclusion_details"]
+            if detail["reason"] == "identical_code"
+        }
+        self.assertEqual(duplicate_of[parent_without_comment.id], parent.id)
+        self.assertEqual(duplicate_of[top_with_different_docstring.id], top.id)
+
+    def test_commentary_only_pair_conflict_is_audited_as_identical_code(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        first = _program(
+            "first",
+            code="def shared():\n    value = 1  # first explanation\n    return value\n",
+        )
+        second = _program(
+            "second",
+            code="def shared():\n    value = 1  # second explanation\n    return value\n",
+        )
+        _install_live(database, parent)
+        _install_owner(database, first, 0)
+        _install_owner(database, second, 1)
+
+        selected, audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=2
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(audit["conflict_edge_count"], 1)
+        self.assertEqual(len(audit["identical_code_exclusions"]), 1)
+        excluded_id = audit["identical_code_exclusions"][0]
+        self.assertIn(excluded_id, {first.id, second.id})
+        self.assertEqual(
+            next(
+                detail["reason"]
+                for detail in audit["exclusion_details"]
+                if detail["program_id"] == excluded_id
+            ),
+            "identical_code",
+        )
+
+    def test_wildcard_cannot_restore_commentary_only_duplicate(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        with_docstring = _program(
+            "with-docstring",
+            code=(
+                "def shared():\n"
+                "    \"\"\"This commentary is removable.\"\"\"\n"
+                "    return 1\n"
+            ),
+        )
+        without_docstring = _program(
+            "without-docstring",
+            code="def shared():\n    return 1\n",
+        )
+        _install_live(database, parent)
+        _install_owner(database, with_docstring, 0)
+        _install_owner(database, without_docstring, 1)
+
+        selected, audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=3
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(audit["core_selected_program_ids"]), 1)
+        self.assertIsNone(audit["wildcard_selected_program_id"])
+        self.assertEqual(audit["conflict_edge_count"], 1)
+        self.assertEqual(len(audit["identical_code_exclusions"]), 1)
+        self.assertIn(
+            audit["identical_code_exclusions"][0],
+            {with_docstring.id, without_docstring.id},
+        )
+
+    def test_executable_difference_remains_true_diversity_eligible(self) -> None:
+        database = _database()
+        parent = _program("parent", island=1)
+        first = _program(
+            "first",
+            code="def shared():\n    # explanation A\n    return 1\n",
+        )
+        second = _program(
+            "second",
+            code="def shared():\n    # explanation B\n    return 2\n",
+        )
+        _install_live(database, parent)
+        _install_owner(database, first, 0)
+        _install_owner(database, second, 1)
+
+        selected, audit = database.sample_true_diverse_inspirations(
+            parent, target_island=0, n=2
+        )
+
+        self.assertEqual({program.id for program in selected}, {first.id, second.id})
+        self.assertEqual(audit["conflict_edge_count"], 0)
+        self.assertEqual(audit["identical_code_exclusions"], [])
+
     def test_excludes_direct_sibling_migration_and_recent_common_ancestor_relations(self) -> None:
         database = _database()
         root = _program("root")

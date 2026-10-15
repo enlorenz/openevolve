@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 
 from openevolve.config import DatabaseConfig
-from openevolve.utils.code_utils import calculate_edit_distance
+from openevolve.utils.code_utils import (
+    calculate_edit_distance,
+    code_without_comments_and_docstrings,
+)
 from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
 
 logger = logging.getLogger(__name__)
@@ -2037,12 +2040,15 @@ class ProgramDatabase:
         ``map_elites_cell`` metadata is never used to establish ownership.
 
         In addition to distinct cells, the selector avoids duplicate source and
-        obvious close relatives of the parent and top prompt examples. Core
-        inspirations are mutually compatible under those same checks; when
-        more than two are requested, one final wildcard may override only the
-        core's lineage conflicts. The lineage check is deliberately
-        best-effort: it follows only live ``parent_id`` links to a small bounded
-        depth and never interprets MAP replacement provenance as ancestry.
+        obvious close relatives of the parent and top prompt examples. Here,
+        ``identical_code`` means exactly identical stored source after removing
+        Python comments and genuine docstrings; it does not imply semantic
+        equivalence. Core inspirations are mutually compatible under those
+        same checks; when more than two are requested, one final wildcard may
+        override only the core's lineage conflicts. The lineage check is
+        deliberately best-effort: it follows only live ``parent_id`` links to
+        a small bounded depth and never interprets MAP replacement provenance
+        as ancestry.
 
         Args:
             parent: Current mutation parent. It may belong to another island
@@ -2197,11 +2203,14 @@ class ProgramDatabase:
                 )
                 continue
 
+            owner_comparison_code = code_without_comments_and_docstrings(owner.code)
             duplicate_of = next(
                 (
                     other.id
                     for other in baseline_programs
-                    if isinstance(other.code, str) and owner.code == other.code
+                    if isinstance(other.code, str)
+                    and owner_comparison_code
+                    == code_without_comments_and_docstrings(other.code)
                 ),
                 None,
             )
@@ -2240,8 +2249,8 @@ class ProgramDatabase:
         audit["individually_eligible_candidate_count"] = eligible_count
         random.shuffle(eligible)
 
-        # Build one undirected conflict graph from the same exact-code and
-        # B-lite relationships previously consulted by the greedy pass.
+        # Build one undirected conflict graph from the same commentary-insensitive
+        # exact-code and B-lite relationships previously consulted by the greedy pass.
         conflicts: List[Set[int]] = [set() for _ in eligible]
         conflict_reasons: Dict[Tuple[int, int], List[str]] = {}
         for first_index in range(eligible_count):
@@ -2285,12 +2294,16 @@ class ProgramDatabase:
         core_index_set = set(core_indices)
         wildcard_index: Optional[int] = None
         if wildcard_enabled:
-            core_codes = {eligible[index][1].code for index in core_indices}
+            core_code_keys = {
+                code_without_comments_and_docstrings(eligible[index][1].code)
+                for index in core_indices
+            }
             wildcard_candidates = [
                 index
                 for index in range(eligible_count)
                 if index not in core_index_set
-                and eligible[index][1].code not in core_codes
+                and code_without_comments_and_docstrings(eligible[index][1].code)
+                not in core_code_keys
             ]
             if wildcard_candidates:
                 wildcard_index = random.choice(wildcard_candidates)
@@ -2306,11 +2319,17 @@ class ProgramDatabase:
         for candidate_index, (cell_key, candidate) in enumerate(eligible):
             if candidate_index in selected_index_set:
                 continue
+            candidate_comparison_code = code_without_comments_and_docstrings(
+                candidate.code
+            )
             duplicate_core_index = next(
                 (
                     core_index
                     for core_index in core_indices
-                    if eligible[core_index][1].code == candidate.code
+                    if code_without_comments_and_docstrings(
+                        eligible[core_index][1].code
+                    )
+                    == candidate_comparison_code
                 ),
                 None,
             )
@@ -2616,9 +2635,11 @@ class ProgramDatabase:
     def _true_diversity_pair_conflict_reasons(
         self, first: Program, second: Program, lineage_depth: int
     ) -> List[str]:
-        """Return exact-code and B-lite reasons making a pair incompatible."""
+        """Return commentary-insensitive exact-code and B-lite pair conflicts."""
         reasons: List[str] = []
-        if first.code == second.code:
+        if code_without_comments_and_docstrings(
+            first.code
+        ) == code_without_comments_and_docstrings(second.code):
             reasons.append("identical_code")
         relationship = self._true_diversity_pair_relationship(
             first, second, lineage_depth
