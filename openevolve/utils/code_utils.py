@@ -3,7 +3,43 @@ Utilities for code parsing, diffing, and manipulation
 """
 
 import re
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
+
+
+_ProgramT = TypeVar("_ProgramT")
+
+
+def select_distinct_code_programs(
+    ranked_programs: Sequence[_ProgramT],
+    limit: int,
+    code_getter: Callable[[_ProgramT], str],
+) -> Tuple[List[_ProgramT], List[_ProgramT]]:
+    """Select the first ``limit`` programs with byte-distinct source code.
+
+    The input is assumed to already be fitness-ranked. This helper never sorts
+    or considers IDs, lineage, metrics, or metadata; it only preserves the
+    input order while skipping exact source-string duplicates.
+
+    Returns:
+        A pair containing the selected programs and duplicate-code programs
+        skipped while filling the requested slots.
+    """
+    selected: List[_ProgramT] = []
+    skipped_duplicates: List[_ProgramT] = []
+    seen_codes: Set[str] = set()
+    requested_count = max(0, int(limit))
+
+    for program in ranked_programs:
+        if len(selected) >= requested_count:
+            break
+        code = code_getter(program)
+        if code in seen_codes:
+            skipped_duplicates.append(program)
+            continue
+        seen_codes.add(code)
+        selected.append(program)
+
+    return selected, skipped_duplicates
 
 
 def parse_evolve_blocks(code: str) -> List[Tuple[int, int, str]]:

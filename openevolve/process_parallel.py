@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.utils.code_utils import select_distinct_code_programs
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
@@ -224,26 +225,47 @@ def _run_iteration_worker(
             reverse=True,
         )
 
-        # The legacy branch intentionally passes T+D ranked programs so the
-        # prompt sampler can create its historical pseudo-diverse block.  The
-        # opt-in branch receives the centrally fixed top IDs and passes only T;
-        # its inspirations are the single centrally selected diverse pool.
+        # The legacy branch passes the distinct-code Top set followed by the
+        # next D unselected ranked programs so the prompt sampler can create
+        # its historical pseudo-diverse block. The opt-in branch receives the
+        # centrally frozen Top IDs and its inspirations are the single
+        # centrally selected diverse pool.
+        top_count = _worker_config.prompt.num_top_programs
         if _worker_config.prompt.true_diversity:
             if top_program_ids is None:
-                programs_for_prompt = island_programs[: _worker_config.prompt.num_top_programs]
+                programs_for_prompt, _ = select_distinct_code_programs(
+                    island_programs,
+                    top_count,
+                    lambda program: program.code,
+                )
             else:
-                programs_for_prompt = [
+                frozen_top_programs = [
                     programs[program_id]
-                    for program_id in top_program_ids[: _worker_config.prompt.num_top_programs]
+                    for program_id in top_program_ids
                     if program_id in programs
                 ]
+                programs_for_prompt, _ = select_distinct_code_programs(
+                    frozen_top_programs,
+                    top_count,
+                    lambda program: program.code,
+                )
             best_programs_only = programs_for_prompt
         else:
-            programs_for_prompt = island_programs[
-                : _worker_config.prompt.num_top_programs
-                + _worker_config.prompt.num_diverse_programs
+            selected_top_programs, _ = select_distinct_code_programs(
+                island_programs,
+                top_count,
+                lambda program: program.code,
+            )
+            selected_top_ids = {program.id for program in selected_top_programs}
+            remaining_ranked_programs = [
+                program
+                for program in island_programs
+                if program.id not in selected_top_ids
             ]
-            best_programs_only = island_programs[: _worker_config.prompt.num_top_programs]
+            programs_for_prompt = selected_top_programs + remaining_ranked_programs[
+                : _worker_config.prompt.num_diverse_programs
+            ]
+            best_programs_only = selected_top_programs
 
         inspiration_dicts = [program.to_dict() for program in inspirations]
         if _worker_config.prompt.true_diversity and true_diversity_provenance:
@@ -1046,10 +1068,12 @@ class ProcessParallelController:
                     ),
                     reverse=True,
                 )
-                top_program_ids = [
-                    program.id
-                    for program in island_programs[: self.config.prompt.num_top_programs]
-                ]
+                top_programs, _ = select_distinct_code_programs(
+                    island_programs,
+                    self.config.prompt.num_top_programs,
+                    lambda program: program.code,
+                )
+                top_program_ids = [program.id for program in top_programs]
 
                 inspirations, true_diversity_provenance = (
                     self.database.sample_true_diverse_inspirations(

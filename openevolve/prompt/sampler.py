@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from openevolve.config import PromptConfig
 from openevolve.prompt.templates import TemplateManager
+from openevolve.utils.code_utils import select_distinct_code_programs
 from openevolve.utils.format_utils import format_metrics_safe
 from openevolve.utils.metrics_utils import (
     safe_numeric_average,
@@ -334,7 +335,11 @@ class PromptSampler:
 
         # Format top programs
         top_programs_str = ""
-        selected_top = top_programs[: min(self.config.num_top_programs, len(top_programs))]
+        selected_top, _ = select_distinct_code_programs(
+            top_programs,
+            self.config.num_top_programs,
+            lambda program: program.get("code", ""),
+        )
 
         for i, program in enumerate(selected_top):
             use_changes = self.config.programs_as_changes_description
@@ -385,14 +390,17 @@ class PromptSampler:
         # Format diverse programs using num_diverse_programs config
         diverse_programs_str = ""
         diverse_programs: List[Dict[str, Any]] = []
+        selected_top_objects = {id(program) for program in selected_top}
+        remaining_programs = [
+            program
+            for program in top_programs
+            if id(program) not in selected_top_objects
+        ]
         if (
             not self.config.true_diversity
             and self.config.num_diverse_programs > 0
-            and len(top_programs) > self.config.num_top_programs
+            and remaining_programs
         ):
-            # Skip the top programs we already included
-            remaining_programs = top_programs[self.config.num_top_programs :]
-
             # Sample diverse programs from the remaining
             num_diverse = min(self.config.num_diverse_programs, len(remaining_programs))
             if num_diverse > 0:
